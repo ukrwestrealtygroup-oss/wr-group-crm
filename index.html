@@ -487,6 +487,1862 @@
         let syncInProgress = false;
         
         // ========== VARIABLES ==========
+        let spaces = [], inquiries = [], proposals = [], objects = ['GALAS', 'W.One Tower', 'MONO', 'Пирогівка'], objectMeta = {}, currentSpaceId = null, currentInquiryId = null, currentMapLink = '', editingListingId = null, currentPhotos = [], currentProposal = null, isEditingProposal = false, managerAuthed = false;
+
+        // Безпечна функція для парсингу hex кольорів в rgba
+        function hexToRgba(hex, opacity = 1) {
+            if (!hex || typeof hex !== 'string' || !hex.startsWith('#')) {
+                return `rgba(74, 140, 111, ${opacity})`; // Default color
+            }
+            try {
+                const r = parseInt(hex.slice(1, 3), 16) || 74;
+                const g = parseInt(hex.slice(3, 5), 16) || 140;
+                const b = parseInt(hex.slice(5, 7), 16) || 111;
+                return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+            } catch (e) {
+                return `rgba(74, 140, 111, ${opacity})`;
+            }
+        }
+
+        // ========== GOOGLE SHEETS SYNC FUNCTIONS ==========
+        async function syncToGoogleSheets() {
+            if (syncInProgress) return;
+            try {
+                syncInProgress = true;
+                
+                // Синхронізуємо пропозиції
+                if (proposals && proposals.length > 0) {
+                    const proposalData = proposals.map(p => ({
+                        ...p,
+                        companyClientLogo: p.companyClientLogo ? p.companyClientLogo.substring(0, 100) : '' // Обмежуємо Base64
+                    }));
+                    
+                    await fetch(APPS_SCRIPT_URL, {
+                        method: 'POST',
+                        body: JSON.stringify({
+                            action: 'saveProposals',
+                            proposals: proposalData
+                        })
+                    });
+                }
+                
+                // Синхронізуємо площі з посиланнями на фото
+                if (spaces && spaces.length > 0) {
+                    const spaceData = spaces.map(s => ({
+                        ...s,
+                        photos: s.photos ? JSON.stringify(s.photos) : '[]', // Зберігаємо посилання, не Base64
+                        photoUrls: s.photos && s.photos.length > 0 ? s.photos.map(p => p.url).join('|') : ''
+                    }));
+                    
+                    await fetch(APPS_SCRIPT_URL, {
+                        method: 'POST',
+                        body: JSON.stringify({
+                            action: 'saveSpaces',
+                            spaces: spaceData
+                        })
+                    });
+                }
+                
+                // Синхронізуємо заявки
+                if (inquiries && inquiries.length > 0) {
+                    await fetch(APPS_SCRIPT_URL, {
+                        method: 'POST',
+                        body: JSON.stringify({
+                            action: 'saveInquiries',
+                            inquiries: inquiries
+                        })
+                    });
+                }
+                
+                console.log('✅ Синхронізація успішна');
+            } catch (error) {
+                console.error('Помилка синхронізації:', error);
+            } finally {
+                syncInProgress = false;
+            }
+        }
+
+        async function syncFromGoogleSheets() {
+            if (syncInProgress) return;
+            try {
+                syncInProgress = true;
+                
+                // Завантажуємо пропозиції
+                const proposalsResponse = await fetch(APPS_SCRIPT_URL, {
+                    method: 'POST',
+                    body: JSON.stringify({ action: 'getProposals' })
+                });
+                const proposalsData = await proposalsResponse.json();
+                if (proposalsData.success && proposalsData.proposals && proposalsData.proposals.length > 0) {
+                    proposals = proposalsData.proposals;
+                }
+                
+                // Завантажуємо заявки
+                const inquiriesResponse = await fetch(APPS_SCRIPT_URL, {
+                    method: 'POST',
+                    body: JSON.stringify({ action: 'getInquiries' })
+                });
+                const inquiriesData = await inquiriesResponse.json();
+                if (inquiriesData.success && inquiriesData.inquiries && inquiriesData.inquiries.length > 0) {
+                    inquiries = inquiriesData.inquiries;
+                }
+                
+                // Завантажуємо площі
+                const spacesResponse = await fetch(APPS_SCRIPT_URL, {
+                    method: 'POST',
+                    body: JSON.stringify({ action: 'getSpaces' })
+                });
+                const spacesData = await spacesResponse.json();
+                if (spacesData.success && spacesData.spaces && spacesData.spaces.length > 0) {
+                    spaces = spacesData.spaces;
+                }
+                
+                console.log('✅ Завантаження з Google Sheets успішне');
+            } catch (error) {
+                console.error('Помилка завантаження:', error);
+            } finally {
+                syncInProgress = false;
+            }
+        }
+
+        // ===== Supabase: завантаження з бази =====
+        async function loadFromSupabase() {
+            if (!sbClient) return { ok: false, hadSpaces: false };
+            try {
+                const [sp, inq, pr, ob] = await Promise.all([
+                    sbClient.from('spaces').select('*'),
+                    sbClient.from('inquiries').select('*'),
+                    sbClient.from('proposals').select('*'),
+                    sbClient.from('objects').select('*').order('sort')
+                ]);
+                const hadSpaces = !!(sp.data && sp.data.length);
+                if (hadSpaces) spaces = sp.data.map(r => r.data).filter(Boolean);
+                if (inq.data) inquiries = inq.data.map(r => r.data).filter(Boolean);
+                if (pr.data) proposals = pr.data.map(r => r.data).filter(Boolean);
+                if (ob.data && ob.data.length) {
+                    objects = ob.data.map(r => r.name);
+                    objectMeta = {};
+                    ob.data.forEach(r => { objectMeta[r.name] = { anchors: r.anchors || '', narrative: r.narrative || '' }; });
+                }
+                // Оновлюємо локальний кеш
+                localStorage.setItem('wrgroup_spaces', JSON.stringify(spaces));
+                localStorage.setItem('wrgroup_inquiries', JSON.stringify(inquiries));
+                localStorage.setItem('wrgroup_proposals', JSON.stringify(proposals));
+                localStorage.setItem('wrgroup_objects', JSON.stringify(objects));
+                localStorage.setItem('wrgroup_object_meta', JSON.stringify(objectMeta));
+                return { ok: true, hadSpaces };
+            } catch (e) {
+                console.error('Supabase load failed', e);
+                return { ok: false, hadSpaces: false };
+            }
+        }
+
+        // ===== Supabase: збереження всіх колекцій =====
+        async function syncToSupabase() {
+            if (!sbClient) return;
+            if (syncInProgress) return;
+            try {
+                syncInProgress = true;
+                const tasks = [];
+                if (spaces.length) tasks.push(sbClient.from('spaces').upsert(spaces.map(s => ({ id: s.id, data: s }))));
+                if (inquiries.length) tasks.push(sbClient.from('inquiries').upsert(inquiries.map(i => ({ id: i.id, data: i }))));
+                if (proposals.length) tasks.push(sbClient.from('proposals').upsert(proposals.map(p => ({ id: p.id, data: p }))));
+                tasks.push(sbClient.from('objects').upsert(objects.map((name, idx) => ({
+                    name,
+                    anchors: (objectMeta[name] || {}).anchors || '',
+                    narrative: (objectMeta[name] || {}).narrative || '',
+                    sort: idx
+                }))));
+                const results = await Promise.all(tasks);
+                results.forEach(r => { if (r && r.error) console.error('Supabase upsert error', r.error); });
+            } catch (e) {
+                console.error('Supabase sync failed', e);
+            } finally {
+                syncInProgress = false;
+            }
+        }
+
+        // ===== Supabase: фото у сховище =====
+        async function uploadPhotoToStorage(file) {
+            const ext = (file.name && file.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
+            const path = `sp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+            const { error } = await sbClient.storage.from('photos').upload(path, file, { upsert: false, contentType: file.type || 'image/jpeg' });
+            if (error) throw error;
+            const { data } = sbClient.storage.from('photos').getPublicUrl(path);
+            return data.publicUrl;
+        }
+
+        const compressImage = (dataUrl, quality = 0.7) => {
+            return new Promise((resolve) => {
+                const img = new Image();
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+                    resolve(canvas.toDataURL('image/jpeg', quality));
+                };
+                img.src = dataUrl;
+            });
+        };
+
+        const loadData = () => {
+            try {
+                const stored = localStorage.getItem('wrgroup_spaces');
+                spaces = stored ? JSON.parse(stored) : defaultSpaces;
+                if (spaces.length < 54) spaces = defaultSpaces;
+                
+                inquiries = JSON.parse(localStorage.getItem('wrgroup_inquiries') || '[]');
+                proposals = JSON.parse(localStorage.getItem('wrgroup_proposals') || '[]');
+                objects = JSON.parse(localStorage.getItem('wrgroup_objects') || '["GALAS", "W.One Tower", "MONO", "Пирогівка"]');
+                objectMeta = JSON.parse(localStorage.getItem('wrgroup_object_meta') || '{}');
+            } catch (e) {
+                spaces = defaultSpaces;
+                inquiries = [];
+                proposals = [];
+                objects = ['GALAS', 'W.One Tower', 'MONO', 'Пирогівка'];
+                objectMeta = {};
+            }
+            localStorage.setItem('wrgroup_spaces', JSON.stringify(spaces));
+            localStorage.setItem('wrgroup_objects', JSON.stringify(objects));
+            renderSpaces();
+            updateObjectSelects();
+            
+            // Періодичне підтягування змін з бази кожні 30 сек
+            // (пропускаємо, якщо відкрита модалка або вже йде синхронізація)
+            setTimeout(() => {
+                setInterval(async () => {
+                    if (syncInProgress) return;
+                    if (document.querySelector('.modal.active')) return;
+                    const res = await loadFromSupabase();
+                    if (res.ok) {
+                        renderSpaces();
+                        updateObjectSelects();
+                        if (document.getElementById('managerView').classList.contains('active')) {
+                            if (typeof renderInquiries === 'function') renderInquiries();
+                            if (typeof renderProposals === 'function') renderProposals();
+                            if (typeof renderListings === 'function') renderListings();
+                            if (typeof renderObjects === 'function') renderObjects();
+                        }
+                    }
+                }, 30000);
+            }, 5000);
+        };
+
+        const saveSpaces = () => {
+            // Локальний кеш тримаємо легким: тільки фото-посилання (URL), без важкого Base64
+            try {
+                const spacesToSave = spaces.map(s => ({
+                    ...s,
+                    photos: (Array.isArray(s.photos) ? s.photos : []).filter(p => typeof p === 'string' && /^https?:\/\//.test(p))
+                }));
+                localStorage.setItem('wrgroup_spaces', JSON.stringify(spacesToSave));
+            } catch (e) {
+                console.warn('Локальний кеш площ не збережено (не критично):', e);
+            }
+            // Головне джерело — база (сюди йдуть повні дані, включно з фото)
+            syncToSupabase();
+        };
+
+        function showLogin() {
+            document.getElementById('loginView').classList.add('active');
+            document.getElementById('clientView').classList.remove('active');
+            document.getElementById('managerView').classList.remove('active');
+            document.getElementById('proposalPageView').classList.remove('active');
+        }
+
+        function showClient() {
+            document.getElementById('loginView').classList.remove('active');
+            document.getElementById('clientView').classList.add('active');
+            document.getElementById('managerView').classList.remove('active');
+            document.getElementById('proposalPageView').classList.remove('active');
+            renderSpaces();
+        }
+
+        function showManager() {
+            document.getElementById('loginView').classList.remove('active');
+            document.getElementById('clientView').classList.remove('active');
+            document.getElementById('managerView').classList.add('active');
+            document.getElementById('proposalPageView').classList.remove('active');
+            updateObjectSelects();
+            renderInquiries();
+        }
+
+        function login() {
+            if (document.getElementById('password').value === 'manager123') {
+                document.getElementById('loginError').textContent = '';
+                managerAuthed = true;
+                showManager();
+            } else {
+                document.getElementById('loginError').textContent = '❌ Неправильний пароль';
+            }
+        }
+
+        let currentPhotoArray = [];
+        let currentPhotoIndex = 0;
+
+        function logout() { managerAuthed = false; showLogin(); }
+        function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+        
+        function openPhotoViewer(photoUrl, photoArray = null) {
+            if (photoArray && photoArray.length > 0) {
+                currentPhotoArray = photoArray;
+                currentPhotoIndex = photoArray.indexOf(photoUrl);
+                if (currentPhotoIndex === -1) currentPhotoIndex = 0;
+            } else {
+                currentPhotoArray = [photoUrl];
+                currentPhotoIndex = 0;
+            }
+            showCurrentPhoto();
+            document.getElementById('photoViewerModal').classList.add('active');
+            updatePhotoNavigation();
+        }
+
+        function showCurrentPhoto() {
+            if (currentPhotoArray.length === 0) return;
+            document.getElementById('photoViewerImage').src = currentPhotoArray[currentPhotoIndex];
+            document.getElementById('photoCounter').textContent = `${currentPhotoIndex + 1} / ${currentPhotoArray.length}`;
+        }
+
+        function updatePhotoNavigation() {
+            document.getElementById('prevPhotoBtn').style.display = currentPhotoArray.length > 1 ? 'flex' : 'none';
+            document.getElementById('nextPhotoBtn').style.display = currentPhotoArray.length > 1 ? 'flex' : 'none';
+        }
+
+        function nextPhoto() {
+            if (currentPhotoArray.length === 0) return;
+            currentPhotoIndex = (currentPhotoIndex + 1) % currentPhotoArray.length;
+            showCurrentPhoto();
+        }
+
+        function previousPhoto() {
+            if (currentPhotoArray.length === 0) return;
+            currentPhotoIndex = (currentPhotoIndex - 1 + currentPhotoArray.length) % currentPhotoArray.length;
+            showCurrentPhoto();
+        }
+
+        // Клавіатура - стрілки
+        document.addEventListener('keydown', (e) => {
+            if (document.getElementById('photoViewerModal').classList.contains('active')) {
+                if (e.key === 'ArrowRight') nextPhoto();
+                if (e.key === 'ArrowLeft') previousPhoto();
+                if (e.key === 'Escape') closeModal('photoViewerModal');
+            }
+        });
+
+        // Свайп для мобіля
+        let touchStartX = 0;
+        document.addEventListener('touchstart', (e) => {
+            if (document.getElementById('photoViewerModal').classList.contains('active')) {
+                touchStartX = e.touches[0].clientX;
+            }
+        });
+        document.addEventListener('touchend', (e) => {
+            if (document.getElementById('photoViewerModal').classList.contains('active')) {
+                const touchEndX = e.changedTouches[0].clientX;
+                if (touchStartX - touchEndX > 50) nextPhoto();
+                if (touchEndX - touchStartX > 50) previousPhoto();
+            }
+        });
+
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
+            event.target.classList.add('active');
+            document.getElementById(tab + 'Tab').style.display = 'block';
+            if (tab === 'inquiries') renderInquiries();
+            else if (tab === 'proposals') renderProposals();
+            else if (tab === 'listings') renderListings();
+            else if (tab === 'objects') renderObjects();
+        }
+
+        function updateObjectSelects() {
+            const selects = document.querySelectorAll('#objectFilter, #listingObject');
+            selects.forEach(select => {
+                const currentValue = select.value;
+                const optionsHtml = objects.map(obj => `<option value="${obj}">${obj}</option>`).join('');
+                if (select.id === 'objectFilter') {
+                    select.innerHTML = '<option value="">Усі об\'єкти</option>' + optionsHtml;
+                } else {
+                    select.innerHTML = '<option value="">Виберіть</option>' + optionsHtml;
+                }
+                select.value = currentValue;
+            });
+        }
+
+        function openAddObjectModal() {
+            document.getElementById('objectName').value = '';
+            document.getElementById('objectDescription').value = '';
+            document.getElementById('addObjectModal').classList.add('active');
+        }
+
+        function submitObject() {
+            const name = document.getElementById('objectName').value.trim();
+            if (!name) { alert('❌ Введіть назву об\'єкта'); return; }
+            if (objects.includes(name)) { alert('❌ Цей об\'єкт уже існує'); return; }
+            objects.push(name);
+            localStorage.setItem('wrgroup_objects', JSON.stringify(objects));
+            alert('✅ Об\'єкт створений!');
+            closeModal('addObjectModal');
+            updateObjectSelects();
+            renderObjects();
+        }
+
+        function renderObjects() {
+            document.getElementById('objectsList').innerHTML = objects.map((obj, i) => {
+                const meta = objectMeta[obj] || {};
+                const filled = (meta.anchors && meta.anchors.trim()) || (meta.narrative && meta.narrative.trim());
+                return `
+                <div class="list-item">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <h3 style="color: #4A8C6F;">${obj}</h3>
+                        <div>
+                            <button class="btn-action primary" onclick="openObjectMeta('${obj.replace(/'/g, "\\'")}')" style="padding: 4px 8px; font-size: 0.8em;">✏️ Дані для пропозиції</button>
+                            <button class="btn-action danger" onclick="deleteObject(${i})" style="padding: 4px 8px; font-size: 0.8em;">🗑️</button>
+                        </div>
+                    </div>
+                    <div style="color: #666; font-size: 0.9em; margin-top: 10px;">
+                        Оголошень: ${spaces.filter(s => s.object === obj).length}
+                        · Дані для пропозиції: ${filled ? '<span style="color:#27ae60;">✓ заповнено</span>' : '<span style="color:#e67e22;">не заповнено</span>'}
+                    </div>
+                </div>
+            `;}).join('');
+        }
+
+        function openObjectMeta(name) {
+            const meta = objectMeta[name] || {};
+            document.getElementById('objectMetaName').value = name;
+            document.getElementById('objectMetaTitle').textContent = 'Дані для пропозиції: ' + name;
+            document.getElementById('objectMetaAnchors').value = meta.anchors || '';
+            document.getElementById('objectMetaNarrative').value = meta.narrative || '';
+            document.getElementById('objectMetaModal').classList.add('active');
+        }
+
+        function saveObjectMeta() {
+            const name = document.getElementById('objectMetaName').value;
+            if (!name) return;
+            objectMeta[name] = {
+                anchors: document.getElementById('objectMetaAnchors').value.trim(),
+                narrative: document.getElementById('objectMetaNarrative').value.trim()
+            };
+            localStorage.setItem('wrgroup_object_meta', JSON.stringify(objectMeta));
+            closeModal('objectMetaModal');
+            renderObjects();
+            alert('✅ Збережено. Тепер це підтягнеться в нові пропозиції по цьому об\'єкту.');
+        }
+
+        function deleteObject(index) {
+            const obj = objects[index];
+            const count = spaces.filter(s => s.object === obj).length;
+            if (count > 0) { alert(`❌ Не можна видалити! Є ${count} оголошень у цьому об'єкті`); return; }
+            if (confirm(`Видалити об'єкт "${obj}"?`)) {
+                objects.splice(index, 1);
+                localStorage.setItem('wrgroup_objects', JSON.stringify(objects));
+                if (sbClient) sbClient.from('objects').delete().eq('name', obj).then(r => { if (r.error) console.error(r.error); });
+                updateObjectSelects();
+                renderObjects();
+            }
+        }
+
+        function renderSpaces() {
+            document.getElementById('spacesGrid').innerHTML = spaces.map(s => `
+                <div class="card" onclick="openSpaceDetails('${s.id}')">
+                    <div class="card-photo">${s.photos && s.photos.length > 0 ? `<img src="${s.photos[0]}" alt="" style="cursor: pointer;" onclick="event.stopPropagation(); openPhotoViewer('${s.photos[0]}', ${JSON.stringify(s.photos).replace(/"/g, '&quot;')})" onerror="this.onerror=null; this.style.display='none';">` : ''}${(!s.photos || s.photos.length === 0) ? '📸' : ''}</div>
+                    <div class="card-header"><div class="card-title">${s.object} - ${s.area} м²</div><div class="card-meta">Поверх ${s.floor} • ${s.type}</div></div>
+                    <div class="card-body">
+                        <div style="background: #f0f7f3; padding: 10px; border-radius: 6px; margin-bottom: 15px; font-weight: 600; color: #4A8C6F; text-align: center;">📏 ${s.area} м²</div>
+                        <div class="card-description">${s.description}</div>
+                        <div class="card-price"><div class="price-item"><span>Ставка:</span><strong>${s.rate} $/м²</strong></div><div class="price-item"><span>Opex:</span><strong>${s.opex} $/м²</strong></div></div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function filterSpaces() {
+            const obj = document.getElementById('objectFilter').value;
+            const type = document.getElementById('typeFilter').value;
+            const area = document.getElementById('areaFilter').value;
+            let filtered = spaces.filter(s => (!obj || s.object === obj) && (!type || s.type === type) && (!area || (area === '500+' ? s.area >= 500 : (() => { const [min, max] = area.split('-').map(Number); return s.area >= min && s.area <= max; })())));
+            document.getElementById('spacesGrid').innerHTML = filtered.map(s => `
+                <div class="card" onclick="openSpaceDetails('${s.id}')">
+                    <div class="card-photo">${s.photos && s.photos.length > 0 ? `<img src="${s.photos[0]}" alt="" style="cursor: pointer;" onclick="event.stopPropagation(); openPhotoViewer('${s.photos[0]}', ${JSON.stringify(s.photos).replace(/"/g, '&quot;')})" onerror="this.onerror=null; this.style.display='none';">` : ''}${(!s.photos || s.photos.length === 0) ? '📸' : ''}</div>
+                    <div class="card-header"><div class="card-title">${s.object} - ${s.area} м²</div><div class="card-meta">Поверх ${s.floor} • ${s.type}</div></div>
+                    <div class="card-body">
+                        <div style="background: #f0f7f3; padding: 10px; border-radius: 6px; margin-bottom: 15px; font-weight: 600; color: #4A8C6F; text-align: center;">📏 ${s.area} м²</div>
+                        <div class="card-description">${s.description}</div>
+                        <div class="card-price"><div class="price-item"><span>Ставка:</span><strong>${s.rate} $/м²</strong></div><div class="price-item"><span>Opex:</span><strong>${s.opex} $/м²</strong></div></div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function openSpaceDetails(id) {
+            const space = spaces.find(s => s.id === id);
+            if (!space) return;
+            currentSpaceId = id;
+            currentMapLink = space.mapLink || '';
+            const base = Math.round(space.area * space.rate);
+            const opex = Math.round(space.area * space.opex);
+            const total = base + opex;
+            document.getElementById('spaceTitle').textContent = `${space.object} - ${space.area} м²`;
+            const photosHtml = space.photos && space.photos.length > 0 ? `<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 20px;">${space.photos.map(url => `<img src="${url}" alt="" style="width: 100%; height: 150px; object-fit: cover; border-radius: 8px; cursor: pointer;" onclick="openPhotoViewer('${url}', ${JSON.stringify(space.photos).replace(/"/g, '&quot;')})" onerror="this.style.display='none'">`).join('')}</div>` : `<div style="background: #f0f0f0; padding: 40px; text-align: center; color: #999; margin-bottom: 20px; border-radius: 8px; font-size: 3em;">📸</div>`;
+            document.getElementById('spacePhotos').innerHTML = photosHtml;
+            document.getElementById('spaceDetails').innerHTML = `<div style="display: grid; gap: 8px;"><div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e0e0e0;"><span>Об'єкт:</span><strong>${space.object}</strong></div><div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e0e0e0;"><span>Тип:</span><strong>${space.type}</strong></div><div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e0e0e0;"><span>Площа:</span><strong>${space.area} м²</strong></div><div style="display: flex; justify-content: space-between; padding: 8px 0;"><span>Поверх:</span><strong>${space.floor}</strong></div></div>`;
+            document.getElementById('spaceCalculator').innerHTML = `<div style="display: grid; gap: 8px;"><div style="display: flex; justify-content: space-between; padding: 10px; background: white; border-radius: 6px;"><span>Базова:</span><strong>${base} $</strong></div><div style="display: flex; justify-content: space-between; padding: 10px; background: white; border-radius: 6px;"><span>Opex:</span><strong>${opex} $</strong></div><div style="display: flex; justify-content: space-between; padding: 12px; background: #f0f7f3; border-radius: 6px; font-weight: 600; color: #4A8C6F; border: 2px solid #4A8C6F;"><span>РАЗОМ:</span><strong>${total} $/міс</strong></div></div>`;
+            document.getElementById('spaceDescription').textContent = space.description;
+            document.getElementById('spaceModal').classList.add('active');
+        }
+
+        // ===== Валідація телефону: +38 і 10 цифр =====
+        function normalizePhone(raw) {
+            let d = (raw || '').replace(/\D/g, '');
+            // Нац. номер завжди починається з 0, тому будь-який '38' на початку — це код країни
+            while (d.startsWith('38')) d = d.slice(2);
+            // Якщо ввели 9 цифр без ведучого 0 (напр. 63...) — додаємо 0
+            if (d.length === 9 && d[0] !== '0') d = '0' + d;
+            return '+38' + d;
+        }
+        function isValidPhone(raw) {
+            return /^\+38\d{10}$/.test(normalizePhone(raw));
+        }
+        function validatePhoneField(el) {
+            if (!el) return false;
+            const hint = document.getElementById(el.id + 'Hint');
+            const raw = el.value.trim();
+            // порожнє або лише префікс — не червонимо на blur, це впіймає перевірка при надсиланні
+            if (raw === '' || raw === '+38' || raw === '+') {
+                el.classList.remove('input-error');
+                if (hint) hint.classList.remove('show');
+                return false;
+            }
+            if (isValidPhone(raw)) {
+                el.value = normalizePhone(raw); // акуратно нормалізуємо вигляд
+                el.classList.remove('input-error');
+                if (hint) hint.classList.remove('show');
+                return true;
+            } else {
+                el.classList.add('input-error');
+                if (hint) hint.classList.add('show');
+                return false;
+            }
+        }
+        function clearPhoneError(el) {
+            if (!el) return;
+            el.classList.remove('input-error');
+            const hint = document.getElementById(el.id + 'Hint');
+            if (hint) hint.classList.remove('show');
+        }
+        function requirePhone(el) {
+            // жорстка перевірка при надсиланні: підсвічує і фокусує, якщо невірно
+            if (!el) return false;
+            const hint = document.getElementById(el.id + 'Hint');
+            if (isValidPhone(el.value)) {
+                el.value = normalizePhone(el.value);
+                el.classList.remove('input-error');
+                if (hint) hint.classList.remove('show');
+                return true;
+            }
+            el.classList.add('input-error');
+            if (hint) hint.classList.add('show');
+            el.focus();
+            return false;
+        }
+
+        // ===== Фільтр і ручні умови в «Новій пропозиції» =====
+        function populateProposalSpaces() {
+            const sel = document.getElementById('proposalSpaceSelect');
+            if (!sel) return;
+            const fObj = document.getElementById('propFilterObject').value;
+            const fType = document.getElementById('propFilterType').value;
+            const fArea = document.getElementById('propFilterArea').value;
+            const prev = sel.value;
+            const list = spaces.filter(s => {
+                if (fObj && s.object !== fObj) return false;
+                if (fType && s.type !== fType) return false;
+                if (fArea) {
+                    const a = parseFloat(s.area) || 0;
+                    if (fArea === '0-50' && !(a <= 50)) return false;
+                    if (fArea === '50-150' && !(a > 50 && a <= 150)) return false;
+                    if (fArea === '150-500' && !(a > 150 && a <= 500)) return false;
+                    if (fArea === '500+' && !(a > 500)) return false;
+                }
+                return true;
+            });
+            sel.innerHTML = '<option value="">Виберіть площу' + (list.length ? '' : ' (нічого не знайдено)') + '</option>' +
+                list.map(s => `<option value="${s.id}">${s.object} — ${s.area} м² (${s.type}, поверх ${s.floor})</option>`).join('');
+            // зберегти вибір, якщо він ще у списку
+            if (prev && list.some(s => String(s.id) === String(prev))) sel.value = prev;
+            else onProposalSpaceChange();
+        }
+        function onProposalSpaceChange() {
+            const sel = document.getElementById('proposalSpaceSelect');
+            const s = spaces.find(x => String(x.id) === String(sel.value));
+            const areaEl = document.getElementById('propArea');
+            const rateEl = document.getElementById('propRate');
+            const opexEl = document.getElementById('propOpex');
+            if (s) {
+                areaEl.value = s.area;
+                rateEl.value = s.rate;
+                opexEl.value = s.opex;
+            } else {
+                areaEl.value = ''; rateEl.value = ''; opexEl.value = '';
+            }
+            // Підставляємо якорі/наратив із даних об'єкта (можна редагувати)
+            const meta = s ? (objectMeta[s.object] || {}) : {};
+            document.getElementById('proposalNarrative').value = meta.narrative || '';
+            document.getElementById('proposalAnchors').value = meta.anchors || '';
+            updateProposalPreview();
+        }
+        function updateProposalPreview() {
+            const box = document.getElementById('propPreview');
+            const area = parseFloat(document.getElementById('propArea').value);
+            const rate = parseFloat(document.getElementById('propRate').value);
+            const opex = parseFloat(document.getElementById('propOpex').value);
+            const period = parseInt(document.getElementById('proposalPeriod').value) || 12;
+            const discount = parseFloat(document.getElementById('proposalDiscount').value) || 0;
+            if (isNaN(area) || isNaN(rate) || isNaN(opex)) { box.style.display = 'none'; return; }
+            const base = Math.round(area * rate);
+            const opexSum = Math.round(area * opex);
+            const monthlyTotal = base + opexSum;
+            const monthlyDisc = Math.round(monthlyTotal * (1 - discount / 100));
+            const periodTotal = monthlyDisc * period;
+            box.style.display = 'block';
+            box.innerHTML = `База ${base} $ + Opex ${opexSum} $ = <strong>${monthlyTotal} $/міс</strong>` +
+                (discount ? ` → зі знижкою ${discount}%: <strong>${monthlyDisc} $/міс</strong>` : '') +
+                `<br>За ${period} міс: <strong>${periodTotal} $</strong>`;
+        }
+
+        function openInquiryModal() {
+            document.getElementById('spaceModal').classList.remove('active');
+            document.getElementById('inquiryModal').classList.add('active');
+            const ph = document.getElementById('inquiryPhone');
+            if (ph) { ph.value = '+38'; ph.classList.remove('input-error'); }
+            const hint = document.getElementById('inquiryPhoneHint');
+            if (hint) hint.classList.remove('show');
+        }
+
+        function openMaps() {
+            if (!currentMapLink || currentMapLink.trim() === '') {
+                alert('❌ Посилання на Google Maps не додано для цього оголошення');
+                return;
+            }
+            window.open(currentMapLink, '_blank');
+        }
+
+        function submitInquiry() {
+            const name = document.getElementById('inquiryName').value;
+            const phoneEl = document.getElementById('inquiryPhone');
+            if (!name.trim()) { alert('❌ Заповніть обов\'язкові поля'); return; }
+            if (!requirePhone(phoneEl)) { alert('❌ Телефон у форматі +38 і 10 цифр'); return; }
+            const phone = phoneEl.value;
+            const space = spaces.find(s => s.id === currentSpaceId);
+            const inquiry = { id: Date.now(), spaceId: currentSpaceId, spaceName: `${space.object} - ${space.area} м²`, name, phone, email: document.getElementById('inquiryEmail').value, comment: document.getElementById('inquiryComment').value, date: new Date().toLocaleString('uk-UA') };
+            inquiries.push(inquiry);
+            localStorage.setItem('wrgroup_inquiries', JSON.stringify(inquiries));
+            syncToSupabase();
+            const msg = `Доброго дня! Мене звати ${name}.\n📱 ${phone}${inquiry.email ? '\n📧 ' + inquiry.email : ''}\n\nМене цікавить: ${inquiry.spaceName}\nКоли можна оглянути приміщення?${inquiry.comment ? '\n\nДодатково: ' + inquiry.comment : ''}`;
+            window.open(`https://t.me/ja_kate?text=${encodeURIComponent(msg)}`, '_blank');
+            alert('✅ Заявка надіслана!');
+            closeModal('inquiryModal');
+            document.getElementById('inquiryName').value = '';
+            document.getElementById('inquiryPhone').value = '+38';
+        }
+
+        function renderInquiries() {
+            const active = inquiries.filter(i => !i.status || i.status !== 'closed');
+            const archived = inquiries.filter(i => i.status === 'closed');
+            const activeHtml = active.length ? active.map(i => `<div class="list-item"><div class="list-header"><div><h3>${i.spaceName}</h3><span style="font-size: 0.85em; color: #999;">📅 ${i.date}</span></div><span style="background: #4A8C6F; color: white; padding: 4px 12px; border-radius: 20px; font-size: 0.8em; font-weight: 600;">🆕</span></div><div style="background: #f9f9f9; padding: 12px; border-radius: 6px; margin: 10px 0;"><div><strong>${i.name}</strong> <span style="color: #4A8C6F;">📱 ${i.phone}</span></div>${i.email ? `<div style="color: #666; font-size: 0.9em;">📧 ${i.email}</div>` : ''}</div><div class="list-actions"><button class="btn-action primary" onclick="openProposalForm(${i.id})">📊 Пропозиція</button><button class="btn-action primary" onclick="markInquiry(${i.id}, 'closed')" style="background: #f39c12;">✅ Закрити</button></div></div>`).join('') : '<div style="padding: 20px; text-align: center; color: #999;">Нема заявок</div>';
+            const archivedHtml = archived.length ? `<div style="margin-top: 30px; padding-top: 20px; border-top: 2px solid #e0e0e0;"><h3 style="color: #4A8C6F; margin-bottom: 15px;">📦 Архів</h3>${archived.map(i => `<div class="list-item" style="opacity: 0.7;"><div style="display: flex; justify-content: space-between;"><strong>${i.name}</strong><button class="btn-action" onclick="markInquiry(${i.id}, 'new')" style="background: #3498db;">↺</button></div></div>`).join('')}</div>` : '';
+            document.getElementById('inquiriesList').innerHTML = activeHtml + archivedHtml;
+        }
+
+        function markInquiry(id, status) {
+            const inq = inquiries.find(i => i.id === id);
+            if (inq) { inq.status = status; localStorage.setItem('wrgroup_inquiries', JSON.stringify(inquiries)); renderInquiries(); }
+        }
+
+        function openProposalForm(id) {
+            currentInquiryId = id;
+            document.getElementById('proposalModalTitle').textContent = 'Створити пропозицію';
+            document.getElementById('proposalClientFields').style.display = 'none';
+            document.getElementById('proposalPeriod').value = '12';
+            document.getElementById('proposalDiscount').value = '0';
+            document.getElementById('proposalNote').value = '';
+            // Підставляємо метраж/ставку/opex із площі заявки (можна редагувати)
+            const inq = inquiries.find(i => i.id === id);
+            const s = inq ? spaces.find(x => String(x.id) === String(inq.spaceId)) : null;
+            document.getElementById('propArea').value = s ? s.area : '';
+            document.getElementById('propRate').value = s ? s.rate : '';
+            document.getElementById('propOpex').value = s ? s.opex : '';
+            const meta = s ? (objectMeta[s.object] || {}) : {};
+            document.getElementById('proposalNarrative').value = meta.narrative || '';
+            document.getElementById('proposalAnchors').value = meta.anchors || '';
+            updateProposalPreview();
+            document.getElementById('proposalModal').classList.add('active');
+        }
+
+        function openNewProposalForm() {
+            currentInquiryId = null;
+            document.getElementById('proposalModalTitle').textContent = 'Нова пропозиція';
+            document.getElementById('proposalClientFields').style.display = 'block';
+            document.getElementById('proposalClientName').value = '';
+            document.getElementById('proposalClientPhone').value = '+38';
+            document.getElementById('proposalClientPhone').classList.remove('input-error');
+            document.getElementById('proposalClientPhoneHint').classList.remove('show');
+            document.getElementById('proposalClientEmail').value = '';
+            document.getElementById('proposalPeriod').value = '12';
+            document.getElementById('proposalDiscount').value = '0';
+            document.getElementById('proposalNote').value = '';
+
+            // Скидаємо фільтри та ручні умови
+            document.getElementById('propFilterObject').value = '';
+            document.getElementById('propFilterType').value = '';
+            document.getElementById('propFilterArea').value = '';
+            document.getElementById('propArea').value = '';
+            document.getElementById('propRate').value = '';
+            document.getElementById('propOpex').value = '';
+            document.getElementById('propPreview').style.display = 'none';
+            document.getElementById('proposalNarrative').value = '';
+            document.getElementById('proposalAnchors').value = '';
+
+            // Заповнюємо список площ (з урахуванням фільтрів)
+            populateProposalSpaces();
+
+            document.getElementById('proposalModal').classList.add('active');
+        }
+
+        function submitProposal() {
+            let space, clientName, clientPhone, clientEmail, spaceName;
+
+            if (currentInquiryId) {
+                // Режим із заявки — дані клієнта беремо з заявки
+                const inquiry = inquiries.find(i => i.id === currentInquiryId);
+                if (!inquiry) { alert('❌ Заявку не знайдено'); return; }
+                space = spaces.find(s => String(s.id) === String(inquiry.spaceId));
+                if (!space) { alert('❌ Площу не знайдено'); return; }
+                clientName = inquiry.name;
+                clientPhone = inquiry.phone;
+                clientEmail = inquiry.email;
+            } else {
+                // Режим з нуля — дані клієнта і площу вводить менеджер
+                clientName = document.getElementById('proposalClientName').value.trim();
+                const phoneEl = document.getElementById('proposalClientPhone');
+                clientEmail = document.getElementById('proposalClientEmail').value.trim();
+                const spaceId = document.getElementById('proposalSpaceSelect').value;
+
+                if (!clientName) { alert('❌ Введіть ім\'я клієнта'); return; }
+                if (!requirePhone(phoneEl)) { alert('❌ Телефон у форматі +38 і 10 цифр'); return; }
+                clientPhone = phoneEl.value;
+                if (!spaceId) { alert('❌ Виберіть площу'); return; }
+
+                space = spaces.find(s => s.id == spaceId);
+                if (!space) { alert('❌ Площу не знайдено'); return; }
+            }
+
+            // Ручні умови (метраж/ставка/opex) — діють в обох режимах, каталог не чіпаємо
+            const mArea = parseFloat(document.getElementById('propArea').value);
+            const mRate = parseFloat(document.getElementById('propRate').value);
+            const mOpex = parseFloat(document.getElementById('propOpex').value);
+            const effArea = isNaN(mArea) ? space.area : mArea;
+            const effRate = isNaN(mRate) ? space.rate : mRate;
+            const effOpex = isNaN(mOpex) ? space.opex : mOpex;
+            space = { ...space, area: effArea, rate: effRate, opex: effOpex };
+            spaceName = `${space.object} — ${effArea} м²`;
+
+            // Якорі + наратив: беремо з полів форми (підставлені з об'єкта, могли бути змінені)
+            const propAnchors = document.getElementById('proposalAnchors').value.trim();
+            const propNarrative = document.getElementById('proposalNarrative').value.trim();
+
+            const period = parseInt(document.getElementById('proposalPeriod').value) || 12;
+            const discount = parseFloat(document.getElementById('proposalDiscount').value) || 0;
+            const note = document.getElementById('proposalNote').value;
+            const base = Math.round(space.area * space.rate);
+            const opex = Math.round(space.area * space.opex);
+            const monthlyTotal = base + opex;
+            const totalWithDiscount = monthlyTotal * (1 - discount / 100);
+            const periodTotal = Math.round(totalWithDiscount * period);
+            
+            const proposal = {
+                id: Date.now(),
+                spaceName: spaceName,
+                spaceId: space.id,
+                clientName: clientName,
+                clientPhone: clientPhone,
+                clientEmail: clientEmail,
+                date: new Date().toLocaleString('uk-UA'),
+                period,
+                discount,
+                monthlyBase: base,
+                monthlyOpex: opex,
+                monthlyTotal: monthlyTotal,
+                monthlyWithDiscount: Math.round(totalWithDiscount),
+                periodTotal,
+                note,
+                companyLogo: '',
+                companyClientLogo: '',
+                objectPresentation: '',
+                designTheme: 'classic',
+                designColorPrimary: '#4A8C6F',
+                designColorBackground: '#ffffff',
+                designColorText: '#333333',
+                spaceData: space,
+                anchors: propAnchors,
+                narrative: propNarrative
+            };
+            
+            proposals.push(proposal);
+            localStorage.setItem('wrgroup_proposals', JSON.stringify(proposals));
+            syncToSupabase();
+            
+            closeModal('proposalModal');
+            showProposalPage(proposal.id);
+        }
+
+        function showProposalPage(proposalId) {
+            try {
+                if (!proposalId) {
+                    console.error('Invalid proposal ID');
+                    showClient();
+                    return;
+                }
+                
+                const proposal = proposals.find(p => p.id === proposalId);
+                if (!proposal) {
+                    console.error('Proposal not found:', proposalId);
+                    showClient();
+                    return;
+                }
+                
+                currentProposal = proposal;
+                const html = generateProposalHTML(proposal);
+                const container = document.getElementById('proposalPageContent');
+                if (container) {
+                    container.innerHTML = html;
+                }
+                
+                document.getElementById('loginView').classList.remove('active');
+                document.getElementById('clientView').classList.remove('active');
+                document.getElementById('managerView').classList.remove('active');
+                document.getElementById('proposalPageView').classList.add('active');
+            } catch(e) {
+                console.error('Error showing proposal:', e);
+                showClient();
+            }
+        }
+
+        function generateProposalHTML(proposal) {
+            // Безпечна обробка значень
+            try {
+                if (!proposal || !proposal.spaceData) {
+                    return '<div style="color: #e74c3c; padding: 20px; text-align: center;">Помилка: неповні дані пропозиції</div>';
+                }
+                
+                // Встановляємо значення за замовчуванням
+                proposal.designColorPrimary = proposal.designColorPrimary || '#4A8C6F';
+                proposal.designColorBackground = proposal.designColorBackground || '#ffffff';
+                proposal.designColorText = proposal.designColorText || '#333333';
+                proposal.companyClientLogo = proposal.companyClientLogo || '';
+                proposal.clientName = proposal.clientName || 'Клієнт';
+                proposal.clientPhone = proposal.clientPhone || '';
+                proposal.clientEmail = proposal.clientEmail || '';
+                proposal.anchors = proposal.anchors || '';
+                proposal.narrative = proposal.narrative || '';
+                
+            const space = proposal.spaceData;
+            const photosHtml = space.photos && space.photos.length > 0 
+                ? `<div class="photo-gallery">${space.photos.map(url => `<img src="${url}" alt="Фото об'єкту" onclick="openPhotoViewer('${url}', ${JSON.stringify(space.photos).replace(/"/g, '&quot;')})" style="cursor: pointer;">`).join('')}</div>`
+                : '<div style="background: #f0f0f0; padding: 60px 20px; text-align: center; border-radius: 8px; color: #999; font-size: 2em;">📸 Немає фото</div>';
+            
+            return `
+                <div class="proposal-page" style="background-color: ${proposal.designColorBackground}; color: ${proposal.designColorText};">
+                    <div style="text-align: right; margin-bottom: 15px;">
+                        <button class="btn-action primary" onclick="backToManager()" style="background: ${proposal.designColorPrimary};">← Назад</button>
+                    </div>
+                    
+                    <!-- Мінімалістична шапка з логотипом компанії -->
+                    <div style="text-align: center; padding: 40px 20px; background: linear-gradient(135deg, ${hexToRgba(proposal.designColorPrimary, 0.02)}, transparent); border-bottom: 1px solid ${proposal.designColorPrimary}; margin-bottom: 40px;">
+                        
+                        ${proposal.companyClientLogo ? `
+                        <div style="margin-bottom: 25px;">
+                            <img src="${proposal.companyClientLogo}" alt="${proposal.clientName}" style="max-height: 120px; max-width: 300px; object-fit: contain; filter: drop-shadow(0 2px 8px rgba(0,0,0,0.1));">
+                        </div>
+                        ` : `
+                        <div style="margin-bottom: 25px; font-size: 3em;">🏢</div>
+                        `}
+                        
+                        <div style="margin-bottom: 15px;">
+                            <p style="color: ${proposal.designColorText}; opacity: 0.6; font-size: 0.95em; margin: 0; letter-spacing: 1px; text-transform: uppercase;">Комерційна пропозиція</p>
+                            <h1 style="color: ${proposal.designColorPrimary}; margin: 8px 0; font-size: 2.2em; font-weight: 600;">${proposal.clientName}</h1>
+                            <p style="color: ${proposal.designColorText}; opacity: 0.5; font-size: 0.9em; margin: 0;">Дата: ${proposal.date}</p>
+                        </div>
+                        
+                        <!-- Тонкі лінії як мінімалістичний елемент -->
+                        <div style="margin-top: 20px; display: flex; align-items: center; justify-content: center; gap: 15px;">
+                            <div style="width: 40px; height: 1px; background: ${proposal.designColorPrimary}; opacity: 0.3;"></div>
+                            <div style="width: 8px; height: 8px; border-radius: 50%; background: ${proposal.designColorPrimary};"></div>
+                            <div style="width: 40px; height: 1px; background: ${proposal.designColorPrimary}; opacity: 0.3;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Hero: 4 ключові цифри (як слайд 2 презентації) -->
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 15px; margin-bottom: 40px;">
+                        <div style="background: ${hexToRgba(proposal.designColorPrimary, 0.06)}; border: 1px solid ${hexToRgba(proposal.designColorPrimary, 0.2)}; border-radius: 12px; padding: 22px 16px; text-align: center;">
+                            <div style="font-size: 1.7em; line-height: 1;">📐</div>
+                            <div style="font-size: 0.78em; opacity: 0.6; text-transform: uppercase; letter-spacing: 1px; margin: 8px 0 4px;">Площа</div>
+                            <div style="font-size: 1.5em; font-weight: 700; color: ${proposal.designColorPrimary};">${space.area} м²</div>
+                        </div>
+                        <div style="background: ${hexToRgba(proposal.designColorPrimary, 0.06)}; border: 1px solid ${hexToRgba(proposal.designColorPrimary, 0.2)}; border-radius: 12px; padding: 22px 16px; text-align: center;">
+                            <div style="font-size: 1.7em; line-height: 1;">🏢</div>
+                            <div style="font-size: 0.78em; opacity: 0.6; text-transform: uppercase; letter-spacing: 1px; margin: 8px 0 4px;">Поверх</div>
+                            <div style="font-size: 1.5em; font-weight: 700; color: ${proposal.designColorPrimary};">${space.floor}</div>
+                        </div>
+                        <div style="background: ${hexToRgba(proposal.designColorPrimary, 0.06)}; border: 1px solid ${hexToRgba(proposal.designColorPrimary, 0.2)}; border-radius: 12px; padding: 22px 16px; text-align: center;">
+                            <div style="font-size: 1.7em; line-height: 1;">💵</div>
+                            <div style="font-size: 0.78em; opacity: 0.6; text-transform: uppercase; letter-spacing: 1px; margin: 8px 0 4px;">Ставка</div>
+                            <div style="font-size: 1.5em; font-weight: 700; color: ${proposal.designColorPrimary};">${space.rate} <span style="font-size: 0.55em; opacity: 0.7;">$/м²</span></div>
+                        </div>
+                        <div style="background: ${hexToRgba(proposal.designColorPrimary, 0.06)}; border: 1px solid ${hexToRgba(proposal.designColorPrimary, 0.2)}; border-radius: 12px; padding: 22px 16px; text-align: center;">
+                            <div style="font-size: 1.7em; line-height: 1;">⚙️</div>
+                            <div style="font-size: 0.78em; opacity: 0.6; text-transform: uppercase; letter-spacing: 1px; margin: 8px 0 4px;">Opex</div>
+                            <div style="font-size: 1.5em; font-weight: 700; color: ${proposal.designColorPrimary};">${space.opex} <span style="font-size: 0.55em; opacity: 0.7;">$/м²</span></div>
+                        </div>
+                    </div>
+
+                    <div class="proposal-section" style="background: ${proposal.designColorBackground}; border-left: 4px solid ${proposal.designColorPrimary}; padding-left: 20px;">
+                        <h2 style="color: ${proposal.designColorPrimary}; font-size: 1.4em; margin-bottom: 20px; font-weight: 600;">Об'єкт оренди</h2>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 20px; margin-bottom: 20px;">
+                            <div><strong>Назва:</strong><br>${space.object}</div>
+                            <div><strong>Площа:</strong><br>${space.area} м²</div>
+                            <div><strong>Тип:</strong><br>${space.type}</div>
+                            <div><strong>Поверх:</strong><br>${space.floor}</div>
+                        </div>
+                        <p style="background: white; padding: 15px; border-radius: 8px; line-height: 1.6;">${space.description}</p>
+                    </div>
+
+                    ${proposal.narrative ? `<div class="proposal-section" style="background: ${proposal.designColorBackground}; border-left: 4px solid ${proposal.designColorPrimary}; padding-left: 20px;">
+                        <h2 style="color: ${proposal.designColorPrimary}; font-size: 1.4em; margin-bottom: 20px; font-weight: 600;">Про будівлю</h2>
+                        <p style="line-height: 1.7;">${proposal.narrative}</p>
+                    </div>` : ''}
+
+                    ${proposal.anchors ? `<div class="proposal-section" style="background: ${proposal.designColorBackground}; border-left: 4px solid ${proposal.designColorPrimary}; padding-left: 20px;">
+                        <h2 style="color: ${proposal.designColorPrimary}; font-size: 1.4em; margin-bottom: 20px; font-weight: 600;">Хто вже в будівлі</h2>
+                        <div style="display: flex; flex-wrap: wrap; gap: 10px;">
+                            ${proposal.anchors.split(',').map(a => a.trim()).filter(Boolean).map(a => `<span style="background: ${hexToRgba(proposal.designColorPrimary, 0.1)}; color: ${proposal.designColorPrimary}; padding: 8px 16px; border-radius: 20px; font-weight: 600; font-size: 0.95em;">${a}</span>`).join('')}
+                        </div>
+                        <p style="margin-top: 14px; opacity: 0.6; font-size: 0.9em;">Бренди, які вже обрали цей об'єкт — гарантований трафік і довіра.</p>
+                    </div>` : ''}
+
+                    <div class="proposal-section" style="background: ${proposal.designColorBackground}; border-left: 4px solid ${proposal.designColorPrimary}; padding-left: 20px;">
+                        <h2 style="color: ${proposal.designColorPrimary}; font-size: 1.4em; margin-bottom: 20px; font-weight: 600;">Фотографії</h2>
+                        ${photosHtml}
+                    </div>
+
+                    ${proposal.objectPresentation ? `<div class="proposal-section" style="background: ${proposal.designColorBackground}; border-left: 4px solid ${proposal.designColorPrimary}; padding-left: 20px;">
+                        <h2 style="color: ${proposal.designColorPrimary}; font-size: 1.4em; margin-bottom: 20px; font-weight: 600;">Презентація об'єкту</h2>
+                        <p style="margin-bottom: 15px; color: ${proposal.designColorText}; opacity: 0.7;">Детальна інформація та особливості об'єкта:</p>
+                        <a href="${proposal.objectPresentation}" target="_blank" style="display: inline-block; padding: 12px 28px; background: ${proposal.designColorPrimary}; color: white; text-decoration: none; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 1em;">Завантажити файл</a>
+                        <p style="margin-top: 15px; font-size: 0.9em; color: ${proposal.designColorText}; opacity: 0.6;">Посилання відкриється у новій вкладці</p>
+                    </div>` : ''}
+
+                    <div class="proposal-section" style="background: ${proposal.designColorBackground}; border-left: 4px solid ${proposal.designColorPrimary}; padding-left: 20px;">
+                        <h2 style="color: ${proposal.designColorPrimary}; font-size: 1.4em; margin-bottom: 20px; font-weight: 600;">Розрахунок вартості</h2>
+                        <div class="calculator-grid">
+                            <div class="calc-card">
+                                <div class="label">Базова ставка</div>
+                                <div class="value">${proposal.monthlyBase} $</div>
+                                <div style="font-size: 0.8em; color: #999; margin-top: 5px;">${space.area} м² × ${space.rate} $/м²</div>
+                            </div>
+                            <div class="calc-card">
+                                <div class="label">Opex</div>
+                                <div class="value">${proposal.monthlyOpex} $</div>
+                                <div style="font-size: 0.8em; color: #999; margin-top: 5px;">${space.area} м² × ${space.opex} $/м²</div>
+                            </div>
+                            <div class="calc-card" style="border-color: ${proposal.designColorPrimary}; background: ${hexToRgba(proposal.designColorPrimary, 0.1)};">
+                                <div class="label">Щомісячна вартість</div>
+                                <div class="value" style="color: ${proposal.designColorPrimary};">${proposal.monthlyTotal} $</div>
+                                <div style="font-size: 0.8em; color: #666; margin-top: 5px;">без урахування знижок</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="proposal-section" style="background: ${proposal.designColorBackground}; border-left: 4px solid ${proposal.designColorPrimary}; padding-left: 20px;">
+                        <h2 style="color: ${proposal.designColorPrimary}; font-size: 1.4em; margin-bottom: 20px; font-weight: 600;">Умови оренди</h2>
+                        <div class="calculator-grid">
+                            <div class="calc-card">
+                                <div class="label" style="color: ${proposal.designColorText};">Період оренди</div>
+                                <div class="value" style="color: ${proposal.designColorPrimary};">${proposal.period}</div>
+                                <div style="font-size: 0.8em; color: ${proposal.designColorText}; opacity: 0.6; margin-top: 5px;">місяців</div>
+                            </div>
+                            <div class="calc-card">
+                                <div class="label" style="color: ${proposal.designColorText};">Знижка</div>
+                                <div class="value" style="color: ${proposal.designColorPrimary};">${proposal.discount}%</div>
+                                <div style="font-size: 0.8em; color: ${proposal.designColorText}; opacity: 0.6; margin-top: 5px;">при підписанні контракту</div>
+                            </div>
+                            <div class="calc-card">
+                                <div class="label" style="color: ${proposal.designColorText};">Щомісячна з урахуванням знижки</div>
+                                <div class="value" style="color: ${proposal.designColorPrimary};">${proposal.monthlyWithDiscount} $</div>
+                                <div style="font-size: 0.8em; color: ${proposal.designColorText}; opacity: 0.6; margin-top: 5px;">прямий розрахунок</div>
+                            </div>
+                            <div class="calc-card" style="border-color: ${proposal.designColorPrimary}; background: ${hexToRgba(proposal.designColorPrimary, 0.1)};">
+                                <div class="label" style="color: ${proposal.designColorText};">РАЗОМ за період</div>
+                                <div class="value" style="font-size: 2.2em; color: ${proposal.designColorPrimary};">${proposal.periodTotal} $</div>
+                                <div style="font-size: 0.8em; color: ${proposal.designColorText}; opacity: 0.6; margin-top: 5px;">${proposal.period} міс × ${proposal.monthlyWithDiscount} $/міс</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    ${proposal.note ? `<div class="proposal-section" style="background: ${proposal.designColorBackground}; border-left: 4px solid ${proposal.designColorPrimary}; padding-left: 20px;">
+                        <h2 style="color: ${proposal.designColorPrimary}; font-size: 1.4em; margin-bottom: 20px; font-weight: 600;">Додаткова інформація</h2>
+                        <p style="line-height: 1.8; color: ${proposal.designColorText};">${proposal.note}</p>
+                    </div>` : ''}
+
+                    <div class="proposal-footer" style="background: ${hexToRgba(proposal.designColorPrimary, 0.02)}; border-top: 1px solid ${proposal.designColorPrimary}; margin-top: 50px; padding-top: 30px;">
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px; margin-bottom: 30px;">
+                            <div>
+                                <h4 style="color: ${proposal.designColorPrimary}; font-size: 0.9em; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px;">Контакти</h4>
+                                <p style="color: ${proposal.designColorText}; margin: 5px 0; font-weight: 600;">${proposal.clientName}</p>
+                                ${proposal.clientPhone ? `<p style="color: ${proposal.designColorText}; opacity: 0.7; margin: 5px 0;"><a href="tel:${proposal.clientPhone}" style="color: ${proposal.designColorPrimary}; text-decoration: none;">${proposal.clientPhone}</a></p>` : ''}
+                                ${proposal.clientEmail ? `<p style="color: ${proposal.designColorText}; opacity: 0.7; margin: 5px 0;"><a href="mailto:${proposal.clientEmail}" style="color: ${proposal.designColorPrimary}; text-decoration: none;">${proposal.clientEmail}</a></p>` : ''}
+                            </div>
+                            <div style="text-align: right;">
+                                <h4 style="color: ${proposal.designColorPrimary}; font-size: 0.9em; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px;">Від</h4>
+                                <p style="color: ${proposal.designColorText}; font-weight: 600; margin: 5px 0;">WR GROUP</p>
+                                <p style="color: ${proposal.designColorText}; opacity: 0.6; margin: 5px 0; font-size: 0.9em;">Комерційна нерухомість</p>
+                            </div>
+                        </div>
+                        
+                        ${proposal.companyLogo ? `<div style="text-align: right; padding-top: 20px; border-top: 1px solid ${proposal.designColorPrimary}; opacity: 0.5;">
+                            <img src="${proposal.companyLogo}" alt="WR Group" style="max-height: 40px; max-width: 150px; object-fit: contain;">
+                        </div>` : ''}
+                        <div style="margin-top: 30px;">
+                            ${managerAuthed ? `
+                            <button class="btn-download" style="background: ${proposal.designColorPrimary};" onclick="openDesignEditor()">🎨 Редагувати дизайн</button>
+                            <button class="btn-download" style="background: ${proposal.designColorPrimary}; margin-left: 10px;" onclick="editProposal()">✏️ Редагувати дані</button>
+                            <button class="btn-download" style="background: #3498db; margin-left: 10px;" onclick="copyProposalLink()">🔗 Поділитись</button>
+                            <button class="btn-download" style="background: #e74c3c; margin-left: 10px;" onclick="sendProposalToTelegram()">📱 Telegram</button>
+                            ` : ''}
+                            <button class="btn-download" style="background: #27ae60;${managerAuthed ? ' margin-left: 10px;' : ''}" onclick="window.print()">🖨️ Зберегти в PDF</button>
+                        </div>
+                        <p style="color: ${proposal.designColorText}; opacity: 0.5; font-size: 0.85em; margin-top: 20px;">© WR GROUP • Комерційна пропозиція</p>
+                    </div>
+                </div>
+            `;
+            } catch(e) {
+                console.error('Error generating proposal HTML:', e);
+                return '<div style="color: #e74c3c; padding: 20px; text-align: center;">Помилка при генерації пропозиції</div>';
+            }
+        }
+
+        function copyProposalLink() {
+            if (!currentProposal) return;
+            const link = `${window.location.origin}${window.location.pathname}?proposal=${currentProposal.id}`;
+            navigator.clipboard.writeText(link).then(() => {
+                alert('✅ Посилання скопійовано! Поділися з клієнтом.');
+            });
+        }
+
+        function sendProposalToTelegram() {
+            if (!currentProposal) return;
+            const link = `${window.location.origin}${window.location.pathname}?proposal=${currentProposal.id}`;
+            const msg = `📊 ПРОПОЗИЦІЯ ДЛЯ ВАС!\n\n${currentProposal.spaceName}\n💰 ${currentProposal.monthlyWithDiscount} $/міс (з урахуванням ${currentProposal.discount}% знижки)\n📋 Період: ${currentProposal.period} місяців\n\nПереглянь детально:\n${link}`;
+            window.open(`https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(msg)}`, '_blank');
+        }
+
+        function backToManager() {
+            isEditingProposal = false;
+            showManager();
+        }
+
+        function openDesignEditor() {
+            if (!currentProposal) return;
+            document.getElementById('designColorPrimary').value = currentProposal.designColorPrimary || '#4A8C6F';
+            document.getElementById('designColorBackground').value = currentProposal.designColorBackground || '#ffffff';
+            document.getElementById('designColorText').value = currentProposal.designColorText || '#333333';
+            updateDesignPreview();
+            document.getElementById('designEditorModal').classList.add('active');
+        }
+
+        function applyDesignTheme(theme) {
+            const themes = {
+                'classic': { primary: '#4A8C6F', bg: '#ffffff', text: '#333333' },
+                'modern': { primary: '#3498db', bg: '#ecf0f1', text: '#2c3e50' },
+                'elegant': { primary: '#9b59b6', bg: '#f5f7fa', text: '#34495e' },
+                'warm': { primary: '#e67e22', bg: '#fff8f0', text: '#2c3e50' }
+            };
+            
+            const colors = themes[theme] || themes['classic'];
+            document.getElementById('designColorPrimary').value = colors.primary;
+            document.getElementById('designColorBackground').value = colors.bg;
+            document.getElementById('designColorText').value = colors.text;
+            updateDesignPreview();
+        }
+
+        function updateDesignPreview() {
+            const primary = document.getElementById('designColorPrimary').value;
+            const bg = document.getElementById('designColorBackground').value;
+            const text = document.getElementById('designColorText').value;
+            
+            const preview = document.getElementById('designPreview');
+            preview.style.backgroundColor = bg;
+            preview.style.color = text;
+            
+            const heading = preview.querySelector('div:first-child');
+            if (heading) heading.style.color = primary;
+            
+            const button = preview.querySelector('button');
+            if (button) {
+                button.style.backgroundColor = primary;
+                button.style.color = 'white';
+            }
+        }
+
+        function saveDesignChanges() {
+            if (!currentProposal) return;
+            
+            currentProposal.designColorPrimary = document.getElementById('designColorPrimary').value;
+            currentProposal.designColorBackground = document.getElementById('designColorBackground').value;
+            currentProposal.designColorText = document.getElementById('designColorText').value;
+            
+            // Зберігаємо у localStorage
+            const proposalIndex = proposals.findIndex(p => p.id === currentProposal.id);
+            if (proposalIndex !== -1) {
+                proposals[proposalIndex] = currentProposal;
+                localStorage.setItem('wrgroup_proposals', JSON.stringify(proposals));
+                syncToSupabase();
+            }
+            
+            closeModal('designEditorModal');
+            showProposalPage(currentProposal.id);
+            alert('✅ Дизайн оновлений!');
+        }
+
+        // ========== ФОТО ПОСИЛАННЯ (Google Drive) ==========
+        function previewClientLogo() {
+            const file = document.getElementById('editProposalClientLogo').files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const img = new Image();
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    const maxWidth = 400, maxHeight = 200;
+                    let width = img.width, height = img.height;
+                    
+                    if (width > height) {
+                        if (width > maxWidth) {
+                            height = (height * maxWidth) / width;
+                            width = maxWidth;
+                        }
+                    } else {
+                        if (height > maxHeight) {
+                            width = (width * maxHeight) / height;
+                            height = maxHeight;
+                        }
+                    }
+                    
+                    canvas.width = width;
+                    canvas.height = height;
+                    ctx.drawImage(img, 0, 0, width, height);
+                    
+                    const compressed = canvas.toDataURL('image/jpeg', 0.7);
+                    if (currentProposal) {
+                        currentProposal.companyClientLogo = compressed;
+                    }
+                    
+                    const preview = document.getElementById('clientLogoPreview');
+                    preview.innerHTML = `<img src="${compressed}" style="max-height: 80px; max-width: 200px; object-fit: contain; border-radius: 6px;">`;
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function recalculateProposal() {
+            if (!currentProposal) return;
+            const period = parseInt(document.getElementById('editProposalPeriod').value) || 1;
+            const discount = parseFloat(document.getElementById('editProposalDiscount').value) || 0;
+            
+            const monthlyBase = currentProposal.monthlyBase;
+            const monthlyOpex = currentProposal.monthlyOpex;
+            const monthlyTotal = monthlyBase + monthlyOpex;
+            const monthlyWithDiscount = Math.round(monthlyTotal * (1 - discount / 100));
+            const periodTotal = monthlyWithDiscount * period;
+            
+            const monthlyEl = document.getElementById('editProposalMonthly');
+            const totalEl = document.getElementById('editProposalTotal');
+            if (monthlyEl) monthlyEl.textContent = monthlyWithDiscount + ' $';
+            if (totalEl) totalEl.textContent = periodTotal + ' $';
+        }
+
+        function editProposal() {
+            if (!currentProposal) return;
+            document.getElementById('editProposalPeriod').value = currentProposal.period;
+            document.getElementById('editProposalDiscount').value = currentProposal.discount;
+            document.getElementById('editProposalLogo').value = currentProposal.companyLogo || '';
+            document.getElementById('editProposalPresentation').value = currentProposal.objectPresentation || '';
+            document.getElementById('editProposalNote').value = currentProposal.note || '';
+            
+            // Показуємо превью логотипу компанії-клієнта
+            const preview = document.getElementById('clientLogoPreview');
+            if (currentProposal.companyClientLogo) {
+                preview.innerHTML = `<img src="${currentProposal.companyClientLogo}" style="max-height: 80px; max-width: 200px; object-fit: contain; border-radius: 6px;">`;
+            } else {
+                preview.innerHTML = '';
+            }
+            
+            recalculateProposal();
+            document.getElementById('editProposalModal').classList.add('active');
+        }
+
+        function saveProposalChanges() {
+            if (!currentProposal) return;
+            
+            const period = parseInt(document.getElementById('editProposalPeriod').value) || currentProposal.period;
+            const discount = parseFloat(document.getElementById('editProposalDiscount').value) || currentProposal.discount;
+            const companyLogo = document.getElementById('editProposalLogo').value;
+            const objectPresentation = document.getElementById('editProposalPresentation').value;
+            const note = document.getElementById('editProposalNote').value;
+            
+            // Оновлюємо пропозицію
+            const monthlyTotal = currentProposal.monthlyBase + currentProposal.monthlyOpex;
+            const monthlyWithDiscount = Math.round(monthlyTotal * (1 - discount / 100));
+            const periodTotal = Math.round(monthlyWithDiscount * period);
+            
+            currentProposal.period = period;
+            currentProposal.discount = discount;
+            currentProposal.companyLogo = companyLogo;
+            currentProposal.objectPresentation = objectPresentation;
+            currentProposal.note = note;
+            currentProposal.monthlyWithDiscount = monthlyWithDiscount;
+            currentProposal.periodTotal = periodTotal;
+            // companyClientLogo зберігається через previewClientLogo()
+            
+            // Зберігаємо у localStorage
+            const proposalIndex = proposals.findIndex(p => p.id === currentProposal.id);
+            if (proposalIndex !== -1) {
+                proposals[proposalIndex] = currentProposal;
+                localStorage.setItem('wrgroup_proposals', JSON.stringify(proposals));
+                syncToSupabase();
+            }
+            
+            closeModal('editProposalModal');
+            showProposalPage(currentProposal.id);
+            alert('✅ Пропозиція оновлена!');
+        }
+
+        function openAddListingModal() {
+            editingListingId = null;
+            document.querySelectorAll('#addListingModal input, #addListingModal select, #addListingModal textarea').forEach(el => el.value = '');
+            currentPhotos = [];
+            renderPhotosPreview();
+            document.getElementById('addListingModal').querySelector('h2').textContent = 'Додати оголошення';
+            document.getElementById('addListingModal').classList.add('active');
+        }
+
+        function editListing(id) {
+            const space = spaces.find(s => s.id === id);
+            if (!space) return;
+            editingListingId = id;
+            document.getElementById('listingObject').value = space.object;
+            document.getElementById('listingArea').value = space.area;
+            document.getElementById('listingFloor').value = space.floor;
+            document.getElementById('listingType').value = space.type;
+            document.getElementById('listingRate').value = space.rate;
+            document.getElementById('listingOpex').value = space.opex;
+            document.getElementById('listingDescription').value = space.description;
+            document.getElementById('listingMapLink').value = space.mapLink || '';
+            currentPhotos = space.photos ? [...space.photos] : [];
+            renderPhotosPreview();
+            document.getElementById('addListingModal').querySelector('h2').textContent = '✏️ Редагувати оголошення';
+            document.getElementById('addListingModal').classList.add('active');
+        }
+
+        async function handlePhotoSelect(event) {
+            const files = event.target.files;
+            for (let file of files) {
+                try {
+                    if (!sbClient) throw new Error('no supabase');
+                    const url = await uploadPhotoToStorage(file);
+                    currentPhotos.push(url);
+                    renderPhotosPreview();
+                } catch (err) {
+                    // Відкат: якщо сховище недоступне — стискаємо у Base64
+                    console.error('Фото → сховище не вдалось, відкат на Base64', err);
+                    const reader = new FileReader();
+                    reader.onload = async (e) => {
+                        const compressed = await compressImage(e.target.result, 0.6);
+                        currentPhotos.push(compressed);
+                        renderPhotosPreview();
+                    };
+                    reader.readAsDataURL(file);
+                }
+            }
+            document.getElementById('photoInput').value = '';
+        }
+
+        function removePhoto(i) {
+            currentPhotos.splice(i, 1);
+            renderPhotosPreview();
+        }
+
+        function renderPhotosPreview() {
+            const list = document.getElementById('photosList');
+            if (currentPhotos.length === 0) {
+                list.innerHTML = '<div style="text-align: center; color: #999; padding: 20px;">Фото не додано</div>';
+                return;
+            }
+            list.innerHTML = currentPhotos.map((url, i) => `<div class="photo-preview"><img src="${url}" alt="" style="cursor: pointer;" onclick="openPhotoViewer('${url}', ${JSON.stringify(currentPhotos).replace(/"/g, '&quot;')})" onerror="this.style.display='none'"><span>Фото ${i+1}</span><button class="btn-action danger" onclick="removePhoto(${i})" style="padding: 4px 8px; font-size: 0.8em;">🗑️</button></div>`).join('');
+        }
+
+        function submitListing() {
+            const obj = document.getElementById('listingObject').value;
+            const area = parseFloat(document.getElementById('listingArea').value);
+            const floor = parseInt(document.getElementById('listingFloor').value);
+            const type = document.getElementById('listingType').value;
+            const rate = parseFloat(document.getElementById('listingRate').value);
+            const opex = parseFloat(document.getElementById('listingOpex').value);
+            const desc = document.getElementById('listingDescription').value;
+            const mapLink = document.getElementById('listingMapLink').value;
+            if (!obj || !area || !floor || !type || !rate || !opex || !desc) { alert('❌ Заповніть усі поля'); return; }
+            if (editingListingId) {
+                const space = spaces.find(s => s.id === editingListingId);
+                if (space) { space.object = obj; space.area = area; space.floor = floor; space.type = type; space.rate = rate; space.opex = opex; space.description = desc; space.mapLink = mapLink; space.photos = currentPhotos; }
+            } else {
+                spaces.push({ id: `${obj.toLowerCase()}-${Date.now()}`, object: obj, area, floor, type, rate, opex, description: desc, mapLink: mapLink, photos: currentPhotos });
+            }
+            saveSpaces();
+            alert('✅ Готово!');
+            closeModal('addListingModal');
+            renderListings();
+            renderSpaces();
+        }
+
+        function renderListings() {
+            document.getElementById('listingsList').innerHTML = spaces.map(s => `<div class="list-item"><div class="list-header"><h3>${s.object} - ${s.area} м²</h3><span style="background: #4A8C6F; color: white; padding: 4px 12px; border-radius: 20px; font-size: 0.8em;">✅</span></div><div style="background: #f9f9f9; padding: 10px; border-radius: 6px; margin: 10px 0; font-size: 0.9em;">Поверх ${s.floor} • ${s.type} • Ставка: ${s.rate} $/м²<br>${s.description}<br>${s.photos && s.photos.length > 0 ? `📸 ${s.photos.length} фото` : '📸 Без фото'}</div><div class="list-actions"><button class="btn-action primary" onclick="editListing('${s.id}')">✏️ Редагувати</button><button class="btn-action danger" onclick="deleteListing('${s.id}')">🗑️ Видалити</button></div></div>`).join('');
+        }
+
+        function renderProposals() {
+            if (!proposals || proposals.length === 0) {
+                document.getElementById('proposalsList').innerHTML = '<div style="text-align: center; color: #999; padding: 40px;">Немає пропозицій</div>';
+                return;
+            }
+            try {
+                document.getElementById('proposalsList').innerHTML = proposals.map(p => {
+                    const id = p.id || Date.now();
+                    const spaceName = p.spaceName || 'Без назви';
+                    const date = p.date || '';
+                    const clientName = p.clientName || 'Невідомо';
+                    const clientPhone = p.clientPhone || '';
+                    const monthly = p.monthlyWithDiscount || 0;
+                    const discount = p.discount || 0;
+                    const period = p.period || 0;
+                    const total = p.periodTotal || 0;
+                    
+                    return `<div class="list-item"><div class="list-header"><div><h3>${spaceName}</h3><span style="color: #999;">${date}</span></div></div><div><strong>${clientName}</strong> | ${clientPhone}</div><div style="margin-top: 10px; color: #4A8C6F; font-weight: 600;">💰 ${monthly} $/міс (${discount}% знижка)</div><div style="margin-top: 10px; color: #666; font-size: 0.9em;">Період: ${period} міс | Разом: ${total} $</div><div class="list-actions"><button class="btn-action primary" onclick="showProposalPage(${id})">👁️ Переглянути</button><button class="btn-action primary" onclick="copyProposalLinkDirect(${id})" style="background: #3498db;">🔗 Посилання</button></div></div>`;
+                }).join('');
+            } catch(e) {
+                console.error('Error rendering proposals:', e);
+            }
+        }
+
+        function copyProposalLinkDirect(proposalId) {
+            const link = `${window.location.origin}${window.location.pathname}?proposal=${proposalId}`;
+            navigator.clipboard.writeText(link).then(() => {
+                alert('✅ Посилання скопійовано!');
+            });
+        }
+
+        function deleteListing(id) {
+            if (confirm('Видалити?')) {
+                spaces = spaces.filter(s => s.id !== id);
+                saveSpaces();
+                if (sbClient) sbClient.from('spaces').delete().eq('id', id).then(r => { if (r.error) console.error(r.error); });
+                renderListings();
+                renderSpaces();
+            }
+        }
+
+        window.addEventListener('load', async () => { 
+            loadData(); 
+            // Тягнемо спільні дані з бази (щоб бачити чужі заявки/пропозиції і щоб клієнт побачив пропозицію)
+            const res = await loadFromSupabase();
+            if (res.ok) {
+                // Якщо в базі ще нема площ — засіваємо поточними (перший запуск)
+                if (!res.hadSpaces) { await syncToSupabase(); }
+                renderSpaces();
+                updateObjectSelects();
+            }
+            const params = new URLSearchParams(window.location.search);
+            const proposalId = params.get('proposal');
+            if (proposalId) {
+                const proposal = proposals.find(p => String(p.id) === proposalId);
+                if (proposal) {
+                    showProposalPage(proposal.id);
+                } else {
+                    showClient();
+                }
+            } else {
+                showClient();
+            }
+        });
+    </script>
+</body>
+</html>        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px; }
+        .card { background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,0.08); cursor: pointer; transition: all 0.3s ease; }
+        .card:hover { transform: translateY(-4px); box-shadow: 0 8px 24px rgba(0,0,0,0.12); }
+        .card-photo { width: 100%; height: 200px; background: #f0f0f0; display: flex; align-items: center; justify-content: center; color: #999; font-size: 3em; overflow: hidden; }
+        .card-photo img { width: 100%; height: 100%; object-fit: cover; }
+        .card-header { background: #f9f9f9; padding: 20px; border-bottom: 2px solid #e0e0e0; }
+        .card-title { font-size: 1.2em; font-weight: 600; margin-bottom: 8px; }
+        .card-meta { font-size: 0.9em; color: #666; }
+        .card-body { padding: 20px; }
+        .card-description { font-size: 0.95em; line-height: 1.6; color: #666; margin-bottom: 15px; }
+        .card-price { background: #f0f7f3; padding: 15px; border-radius: 8px; font-size: 0.9em; }
+        .price-item { display: flex; justify-content: space-between; margin-bottom: 8px; }
+        .proposal-page { background: white; padding: 40px 20px; }
+        .proposal-header { text-align: center; margin-bottom: 40px; border-bottom: 3px solid #4A8C6F; padding-bottom: 30px; }
+        .proposal-header h1 { color: #4A8C6F; font-size: 2.5em; margin-bottom: 10px; }
+        .proposal-section { background: #f9f9f9; padding: 30px; border-radius: 12px; margin-bottom: 30px; }
+        .proposal-section h2 { color: #4A8C6F; margin-bottom: 20px; font-size: 1.5em; border-bottom: 2px solid #4A8C6F; padding-bottom: 10px; }
+        .photo-gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        .photo-gallery img { width: 100%; height: 250px; object-fit: cover; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .calculator-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
+        .calc-card { background: white; padding: 20px; border-radius: 8px; border: 2px solid #e0e0e0; text-align: center; }
+        .calc-card .label { font-size: 0.9em; color: #666; margin-bottom: 10px; }
+        .calc-card .value { font-size: 1.8em; font-weight: 600; color: #4A8C6F; }
+        .proposal-footer { text-align: center; padding: 30px; background: #f0f7f3; border-radius: 12px; margin-top: 40px; }
+        .proposal-footer p { color: #666; margin-bottom: 15px; }
+        .btn-download { padding: 15px 30px; background: #4A8C6F; color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 1em; }
+        .btn-download:hover { background: #3a6b54; }
+        @media print { body { background: white; } .proposal-page { padding: 0; } }
+        .modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; overflow-y: auto; }
+        .modal.active { display: flex; align-items: center; justify-content: center; }
+        .modal-content { background: white; border-radius: 12px; padding: 30px; max-width: 600px; width: 90%; max-height: 90vh; overflow-y: auto; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .modal-header h2 { color: #4A8C6F; }
+        .close-btn { background: none; border: none; font-size: 1.5em; cursor: pointer; color: #999; }
+        .manager-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .manager-buttons { display: flex; gap: 10px; }
+        .logout-btn { padding: 10px 20px; background: #e74c3c; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        .back-btn { padding: 10px 20px; background: #3498db; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; background: white; padding: 15px; border-radius: 12px; overflow-x: auto; }
+        .tab-btn { padding: 10px 20px; background: #e0e0e0; border: none; border-radius: 6px; cursor: pointer; font-weight: 500; white-space: nowrap; }
+        .tab-btn.active { background: #4A8C6F; color: white; }
+        .list-item { border-bottom: 1px solid #e0e0e0; padding: 20px; background: white; margin-bottom: 10px; border-radius: 8px; }
+        .list-item:hover { background: #f9f9f9; }
+        .list-header { display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px; gap: 10px; }
+        .list-header h3 { color: #4A8C6F; }
+        .list-actions { display: flex; gap: 10px; margin-top: 15px; flex-wrap: wrap; }
+        .btn-action { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9em; font-weight: 600; }
+        .btn-action.primary { background: #4A8C6F; color: white; }
+        .btn-action.danger { background: #e74c3c; color: white; }
+        .text-area { width: 100%; padding: 10px; border: 2px solid #e0e0e0; border-radius: 6px; font-family: inherit; resize: vertical; min-height: 100px; }
+        .error { color: #e74c3c; text-align: center; margin-bottom: 15px; }
+        .photos-section { background: #f9f9f9; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+        .photos-section h4 { margin-bottom: 15px; color: #4A8C6F; }
+        .photo-input-label { display: inline-block; width: 100%; padding: 30px; background: white; border: 2px dashed #4A8C6F; border-radius: 8px; text-align: center; cursor: pointer; color: #4A8C6F; font-weight: 600; margin-bottom: 15px; }
+        .photo-input-label:hover { background: #f0f7f3; }
+        .photo-input-label input { display: none; }
+        #photosList { max-height: 250px; overflow-y: auto; }
+        .photo-preview { background: white; padding: 10px; margin-bottom: 10px; border-radius: 6px; display: flex; gap: 10px; align-items: center; word-break: break-all; }
+        .photo-preview img { width: 60px; height: 60px; object-fit: cover; border-radius: 4px; flex-shrink: 0; }
+        .photo-preview span { flex: 1; font-size: 0.9em; color: #666; }
+        @media (max-width: 768px) {
+            .search-controls { flex-direction: column; align-items: stretch; }
+            select { min-width: 100%; }
+            .grid { grid-template-columns: 1fr; }
+            .manager-header { flex-direction: column; gap: 15px; text-align: center; }
+            .manager-buttons { flex-direction: column; width: 100%; }
+            .manager-buttons button { width: 100%; }
+            .tabs { flex-direction: column; }
+            header h1 { font-size: 1.5em; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>WR GROUP CRM</h1>
+            <p>Система управління пропозиціями оренди комерційних площ</p>
+        </header>
+    </div>
+
+    <div id="loginView" class="view active">
+        <div class="login-box">
+            <h2>Вхід для менеджера</h2>
+            <div id="loginError" class="error"></div>
+            <div class="form-group">
+                <label>Пароль</label>
+                <input type="password" id="password">
+            </div>
+            <button class="btn" onclick="login()">Вхід</button>
+            <button class="btn" style="width: 100%; background: #e0e0e0; color: #333; margin-top: 20px;" onclick="showClient()">📋 Переглянути каталог</button>
+        </div>
+    </div>
+
+    <div id="clientView" class="view">
+        <div class="container">
+            <div class="search-section">
+                <h2 style="text-align: center; margin-bottom: 20px;">Доступні площі</h2>
+                <div class="search-controls">
+                    <div class="control-group">
+                        <label>Об'єкт</label>
+                        <select id="objectFilter"><option value="">Усі об'єкти</option><option value="GALAS">GALAS</option><option value="W.One Tower">W.One Tower</option><option value="MONO">MONO</option><option value="Пирогівка">Пирогівка</option></select>
+                    </div>
+                    <div class="control-group">
+                        <label>Тип</label>
+                        <select id="typeFilter"><option value="">Усі типи</option><option value="Офіс">Офіс</option><option value="Комерція">Комерція</option></select>
+                    </div>
+                    <div class="control-group">
+                        <label>Метраж</label>
+                        <select id="areaFilter"><option value="">Усі розміри</option><option value="0-50">до 50 м²</option><option value="50-150">50–150 м²</option><option value="150-500">150–500 м²</option><option value="500+">500+ м²</option></select>
+                    </div>
+                    <button class="btn" style="width: auto;" onclick="filterSpaces()">Пошук</button>
+                </div>
+            </div>
+            <div class="grid" id="spacesGrid"></div>
+            <div style="text-align: center; margin-top: 40px; padding-top: 40px; border-top: 1px solid #e0e0e0;">
+                <button class="btn" style="width: auto; background: #e0e0e0; color: #333;" onclick="showLogin()">← Вхід менеджера</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="managerView" class="view">
+        <div class="container">
+            <div class="manager-header">
+                <h2>CRM Панель менеджера</h2>
+                <div class="manager-buttons">
+                    <button class="back-btn" onclick="showClient()">← Каталог</button>
+                    <button class="logout-btn" onclick="logout()">Вихід</button>
+                </div>
+            </div>
+            <div class="tabs">
+                <button class="tab-btn active" onclick="switchTab('inquiries')">Заявки</button>
+                <button class="tab-btn" onclick="switchTab('proposals')">Пропозиції</button>
+                <button class="tab-btn" onclick="switchTab('listings')">Оголошення</button>
+                <button class="tab-btn" onclick="switchTab('objects')">Об'єкти</button>
+            </div>
+            <div id="inquiriesTab" class="tab-content"><div id="inquiriesList"></div></div>
+            <div id="proposalsTab" class="tab-content" style="display: none;"><button class="btn" style="margin-bottom: 20px;" onclick="openNewProposalForm()">+ Нова пропозиція</button><div id="proposalsList"></div></div>
+            <div id="listingsTab" class="tab-content" style="display: none;">
+                <div style="margin-bottom: 20px;">
+                    <button class="btn" onclick="openAddListingModal()" style="width: auto;">➕ Додати оголошення</button>
+                </div>
+                <div id="listingsList"></div>
+            </div>
+            <div id="objectsTab" class="tab-content" style="display: none;">
+                <div style="margin-bottom: 20px;">
+                    <button class="btn" onclick="openAddObjectModal()" style="width: auto;">➕ Додати новий об'єкт</button>
+                </div>
+                <div id="objectsList"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="spaceModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="spaceTitle"></h2>
+                <button class="close-btn" onclick="closeModal('spaceModal')">×</button>
+            </div>
+            <div id="spacePhotos"></div>
+            <div style="background: #f9f9f9; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                <h3 style="color: #4A8C6F; margin-bottom: 15px;">Деталі приміщення</h3>
+                <div id="spaceDetails"></div>
+            </div>
+            <div style="background: #f9f9f9; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                <h3 style="color: #4A8C6F; margin-bottom: 15px;">💰 Розрахунок (на місяць)</h3>
+                <div id="spaceCalculator"></div>
+            </div>
+            <div id="spaceDescription" style="line-height: 1.6; color: #666; margin-bottom: 20px; padding: 15px; background: #f9f9f9; border-radius: 8px;"></div>
+            <button class="btn" style="margin-bottom: 10px;" onclick="openMaps()">📍 Посилання на картах</button>
+            <button class="btn" style="margin-bottom: 10px;" onclick="openInquiryModal()">📋 Залишити заявку</button>
+            <button class="btn" style="background: #e0e0e0; color: #333;" onclick="closeModal('spaceModal')">Закрити</button>
+        </div>
+    </div>
+
+    <div id="proposalPageView" class="view">
+        <div class="container" id="proposalPageContent"></div>
+    </div>
+
+    <div id="inquiryModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header"><h2>Залишити заявку</h2><button class="close-btn" onclick="closeModal('inquiryModal')">×</button></div>
+            <div class="form-group"><label>Ім'я *</label><input type="text" id="inquiryName" required></div>
+            <div class="form-group"><label>Телефон *</label><input type="tel" id="inquiryPhone" required placeholder="+380..." oninput="clearPhoneError(this)" onblur="validatePhoneField(this)"><div class="field-hint" id="inquiryPhoneHint">Формат: +38 і 10 цифр</div></div>
+            <div class="form-group"><label>Email</label><input type="email" id="inquiryEmail"></div>
+            <div class="form-group"><label>Коментар</label><textarea id="inquiryComment" class="text-area"></textarea></div>
+            <button class="btn" onclick="submitInquiry()">Надіслати заявку</button>
+        </div>
+    </div>
+
+    <div id="proposalModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header"><h2 id="proposalModalTitle">Створити пропозицію</h2><button class="close-btn" onclick="closeModal('proposalModal')">×</button></div>
+            <div id="proposalClientFields" style="display: none;">
+                <div class="form-group"><label>Ім'я клієнта *</label><input type="text" id="proposalClientName" placeholder="Напр. Іван Петренко"></div>
+                <div class="form-group"><label>Телефон *</label><input type="tel" id="proposalClientPhone" placeholder="+380..." oninput="clearPhoneError(this)" onblur="validatePhoneField(this)"><div class="field-hint" id="proposalClientPhoneHint">Формат: +38 і 10 цифр</div></div>
+                <div class="form-group"><label>Email (необов'язково)</label><input type="email" id="proposalClientEmail" placeholder="email@example.com"></div>
+                <div class="form-group">
+                    <label>Площа *</label>
+                    <div class="prop-filter-row">
+                        <select id="propFilterObject" onchange="populateProposalSpaces()"><option value="">Усі об'єкти</option><option value="GALAS">GALAS</option><option value="W.One Tower">W.One Tower</option><option value="MONO">MONO</option><option value="Пирогівка">Пирогівка</option></select>
+                        <select id="propFilterType" onchange="populateProposalSpaces()"><option value="">Усі типи</option><option value="Офіс">Офіс</option><option value="Комерція">Комерція</option></select>
+                        <select id="propFilterArea" onchange="populateProposalSpaces()"><option value="">Усі розміри</option><option value="0-50">до 50 м²</option><option value="50-150">50–150 м²</option><option value="150-500">150–500 м²</option><option value="500+">500+ м²</option></select>
+                    </div>
+                    <select id="proposalSpaceSelect" onchange="onProposalSpaceChange()"><option value="">Виберіть площу</option></select>
+                </div>
+            </div>
+            <div id="proposalOverrideFields">
+                <div class="form-group">
+                    <label>Умови (можна змінити під домовленість)</label>
+                    <div class="prop-override-row">
+                        <div><label style="font-size:0.82em; color:#666;">Метраж, м²</label><input type="number" id="propArea" min="0" step="0.01" placeholder="—" oninput="updateProposalPreview()"></div>
+                        <div><label style="font-size:0.82em; color:#666;">Ставка, $/м²</label><input type="number" id="propRate" min="0" step="0.01" placeholder="—" oninput="updateProposalPreview()"></div>
+                        <div><label style="font-size:0.82em; color:#666;">Opex, $/м²</label><input type="number" id="propOpex" min="0" step="0.01" placeholder="—" oninput="updateProposalPreview()"></div>
+                    </div>
+                </div>
+                <div class="prop-preview" id="propPreview" style="display:none;"></div>
+                <div class="form-group">
+                    <label>Про будівлю (наратив «чому тут»)</label>
+                    <textarea id="proposalNarrative" class="text-area" placeholder="2–3 речення: трафік, екосистема, лайфстайл"></textarea>
+                    <div style="font-size:0.82em; color:#888; margin-top:4px;">Підставляється з даних об'єкта, можна змінити під цю пропозицію.</div>
+                </div>
+                <div class="form-group">
+                    <label>Хто вже в будівлі (якірні орендарі)</label>
+                    <textarea id="proposalAnchors" class="text-area" placeholder="Через кому: Нова Пошта, Сімі, Подорожник, Sport Life"></textarea>
+                </div>
+            </div>
+            <div class="form-group"><label>Період (місяців)</label><input type="number" id="proposalPeriod" value="12" min="1"></div>
+            <div class="form-group"><label>Знижка (%)</label><input type="number" id="proposalDiscount" value="0" min="0" max="100"></div>
+            <div class="form-group"><label>Додаткова інформація</label><textarea id="proposalNote" class="text-area"></textarea></div>
+            <button class="btn" onclick="submitProposal()">Створити пропозицію</button>
+        </div>
+    </div>
+
+    <div id="designEditorModal" class="modal">
+        <div class="modal-content" style="max-width: 800px;">
+            <div class="modal-header"><h2>🎨 Редактор дизайну пропозиції</h2><button class="close-btn" onclick="closeModal('designEditorModal')">×</button></div>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <div>
+                    <h4 style="color: #4A8C6F; margin-bottom: 15px;">📋 Шаблони дизайну</h4>
+                    <div style="display: flex; flex-direction: column; gap: 10px;">
+                        <button class="btn-action primary" onclick="applyDesignTheme('classic')" style="text-align: left; padding: 15px;">
+                            <strong>🟢 Класичний</strong><br>
+                            <small style="color: #999;">Темно-зелена тема (за замовчуванням)</small>
+                        </button>
+                        <button class="btn-action primary" onclick="applyDesignTheme('modern')" style="text-align: left; padding: 15px; background: #3498db;">
+                            <strong>🔵 Сучасний</strong><br>
+                            <small style="color: #999;">Синя мінімалістична тема</small>
+                        </button>
+                        <button class="btn-action primary" onclick="applyDesignTheme('elegant')" style="text-align: left; padding: 15px; background: #9b59b6;">
+                            <strong>💜 Елегантний</strong><br>
+                            <small style="color: #999;">Фіолетова професійна тема</small>
+                        </button>
+                        <button class="btn-action primary" onclick="applyDesignTheme('warm')" style="text-align: left; padding: 15px; background: #e67e22;">
+                            <strong>🟠 Теплий</strong><br>
+                            <small style="color: #999;">Помаранчева енергійна тема</small>
+                        </button>
+                    </div>
+                </div>
+                
+                <div>
+                    <h4 style="color: #4A8C6F; margin-bottom: 15px;">🎨 Кольори</h4>
+                    <div style="display: flex; flex-direction: column; gap: 12px;">
+                        <div>
+                            <label style="font-size: 0.9em; color: #666;">Основний колір:</label>
+                            <input type="color" id="designColorPrimary" value="#4A8C6F" onchange="updateDesignPreview()">
+                        </div>
+                        <div>
+                            <label style="font-size: 0.9em; color: #666;">Колір фону:</label>
+                            <input type="color" id="designColorBackground" value="#ffffff" onchange="updateDesignPreview()">
+                        </div>
+                        <div>
+                            <label style="font-size: 0.9em; color: #666;">Колір тексту:</label>
+                            <input type="color" id="designColorText" value="#333333" onchange="updateDesignPreview()">
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div style="margin-top: 20px; border-top: 2px solid #e0e0e0; padding-top: 20px;">
+                <h4 style="color: #4A8C6F; margin-bottom: 15px;">👁️ Превью:</h4>
+                <div id="designPreview" style="background: white; padding: 20px; border-radius: 8px; border: 2px solid #e0e0e0; min-height: 150px;">
+                    <div style="text-align: center;">
+                        <div style="font-size: 2em; font-weight: bold; color: #4A8C6F; margin-bottom: 10px;">📊 ПРОПОЗИЦІЯ</div>
+                        <button style="padding: 10px 20px; background: #4A8C6F; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;">Приклад кнопки</button>
+                    </div>
+                </div>
+            </div>
+            
+            <button class="btn" style="margin-top: 20px; width: 100%;" onclick="saveDesignChanges()">✅ Зберегти дизайн</button>
+            <button class="btn" style="background: #e0e0e0; color: #333; margin-top: 10px; width: 100%;" onclick="closeModal('designEditorModal')">Скасувати</button>
+        </div>
+    </div>
+
+    <div id="editProposalModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header"><h2>✏️ Редагувати пропозицію</h2><button class="close-btn" onclick="closeModal('editProposalModal')">×</button></div>
+            <div class="form-group"><label>🏢 Логотип компанії-клієнта (завантажити)</label><input type="file" id="editProposalClientLogo" accept="image/*" onchange="previewClientLogo()"></div>
+            <div id="clientLogoPreview" style="margin-bottom: 15px;"></div>
+            <div class="form-group"><label>Період оренди (місяців)</label><input type="number" id="editProposalPeriod" min="1" onchange="recalculateProposal()"></div>
+            <div class="form-group"><label>Знижка (%)</label><input type="number" id="editProposalDiscount" min="0" max="100" onchange="recalculateProposal()"></div>
+            <div class="form-group"><label>🏢 Логотип компанії (URL)</label><input type="url" id="editProposalLogo" placeholder="https://example.com/logo.png"></div>
+            <div class="form-group"><label>📊 Посилання на презентацію об'єкта</label><input type="url" id="editProposalPresentation" placeholder="https://example.com/presentation.pdf"></div>
+            <div class="form-group"><label>Додаткова інформація</label><textarea id="editProposalNote" class="text-area"></textarea></div>
+            <div style="background: #f0f7f3; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
+                <h4 style="color: #4A8C6F; margin-bottom: 15px;">📊 Перерахунок:</h4>
+                <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
+                    <div><small style="color: #666;">Щомісячно (з урахуванням знижки):</small><div id="editProposalMonthly" style="font-size: 1.5em; color: #4A8C6F; font-weight: 600;">0 $</div></div>
+                    <div><small style="color: #666;">Разом за період:</small><div id="editProposalTotal" style="font-size: 1.5em; color: #4A8C6F; font-weight: 600;">0 $</div></div>
+                </div>
+            </div>
+            <button class="btn" onclick="saveProposalChanges()">✅ Зберегти зміни</button>
+            <button class="btn" style="background: #e0e0e0; color: #333; margin-top: 10px;" onclick="closeModal('editProposalModal')">Скасувати</button>
+        </div>
+    </div>
+
+    <div id="photoViewerModal" class="modal" onclick="if(event.target === this) closeModal('photoViewerModal')">
+        <div style="position: relative; max-width: 95vw; max-height: 95vh; display: flex; align-items: center; justify-content: center; width: 100%;">
+            <button class="close-btn" onclick="closeModal('photoViewerModal')" style="position: absolute; top: 10px; right: 10px; background: white; border-radius: 50%; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; z-index: 1001; box-shadow: 0 2px 8px rgba(0,0,0,0.2);">×</button>
+            
+            <button id="prevPhotoBtn" onclick="previousPhoto()" style="position: absolute; left: 20px; background: white; border: none; border-radius: 50%; width: 50px; height: 50px; font-size: 24px; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.2); z-index: 1001;">‹</button>
+            
+            <img id="photoViewerImage" src="" alt="" style="max-width: 90vw; max-height: 90vh; object-fit: contain; border-radius: 8px; touch-action: none;">
+            
+            <button id="nextPhotoBtn" onclick="nextPhoto()" style="position: absolute; right: 20px; background: white; border: none; border-radius: 50%; width: 50px; height: 50px; font-size: 24px; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.2); z-index: 1001;">›</button>
+            
+            <div id="photoCounter" style="position: absolute; bottom: 20px; background: rgba(0,0,0,0.6); color: white; padding: 10px 20px; border-radius: 20px; font-weight: 600; z-index: 1001;">1 / 1</div>
+        </div>
+    </div>
+
+    <div id="addObjectModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header"><h2>Додати новий об'єкт</h2><button class="close-btn" onclick="closeModal('addObjectModal')">×</button></div>
+            <div class="form-group"><label>Назва об'єкта *</label><input type="text" id="objectName" placeholder="Наприклад: LOCUS, Апекс" required></div>
+            <div class="form-group"><label>Опис</label><textarea id="objectDescription" class="text-area" placeholder="Опис об'єкта"></textarea></div>
+            <button class="btn" onclick="submitObject()">✅ Створити</button>
+        </div>
+    </div>
+
+    <div id="objectMetaModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header"><h2 id="objectMetaTitle">Дані для пропозиції</h2><button class="close-btn" onclick="closeModal('objectMetaModal')">×</button></div>
+            <input type="hidden" id="objectMetaName">
+            <div class="form-group">
+                <label>Якірні орендарі («хто вже в будівлі»)</label>
+                <textarea id="objectMetaAnchors" class="text-area" placeholder="Через кому: Нова Пошта, Сімі, Подорожник, Sport Life, ForYou"></textarea>
+                <div style="font-size:0.82em; color:#888; margin-top:4px;">Показується в пропозиції як бренди-сусіди. Пиши через кому.</div>
+            </div>
+            <div class="form-group">
+                <label>Про будівлю (наратив «чому тут»)</label>
+                <textarea id="objectMetaNarrative" class="text-area" placeholder="2–3 речення: трафік, екосистема, лайфстайл — чому орендареві вигідно бути саме тут"></textarea>
+            </div>
+            <button class="btn" onclick="saveObjectMeta()">✅ Зберегти</button>
+        </div>
+    </div>
+
+    <div id="addListingModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header"><h2>Додати оголошення</h2><button class="close-btn" onclick="closeModal('addListingModal')">×</button></div>
+            <div class="form-group"><label>Об'єкт *</label><select id="listingObject" required><option value="">Виберіть</option><option value="GALAS">GALAS</option><option value="W.One Tower">W.One Tower</option><option value="MONO">MONO</option><option value="Пирогівка">Пирогівка</option></select></div>
+            <div class="form-group"><label>Площа (м²) *</label><input type="number" id="listingArea" required step="0.01"></div>
+            <div class="form-group"><label>Поверх *</label><input type="number" id="listingFloor" required></div>
+            <div class="form-group"><label>Тип *</label><select id="listingType" required><option value="">Виберіть</option><option value="Офіс">Офіс</option><option value="Комерція">Комерція</option></select></div>
+            <div class="form-group"><label>Ставка ($/м²) *</label><input type="number" id="listingRate" required step="0.01"></div>
+            <div class="form-group"><label>Opex ($/м²) *</label><input type="number" id="listingOpex" required step="0.01"></div>
+            <div class="form-group"><label>Опис *</label><textarea id="listingDescription" class="text-area" required></textarea></div>
+            <div class="form-group"><label>Посилання на Google Maps</label><input type="url" id="listingMapLink" placeholder="https://maps.google.com/..."></div>
+            <div class="photos-section">
+                <h4>📸 Фото оголошення</h4>
+                <label class="photo-input-label">
+                    📁 Клікни або перетягни фото сюди
+                    <input type="file" id="photoInput" accept="image/*" onchange="handlePhotoSelect(event)">
+                </label>
+                <div id="photosList"></div>
+            </div>
+            <button class="btn" onclick="submitListing()">✅ Зберегти</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script>
+        // ===== Supabase =====
+        const SB_URL = 'https://tunutslelahbtjktebwh.supabase.co';
+        const SB_KEY = 'sb_publishable_IDYA8_X0q97yOhIN3x8Iwg_F_6jGzNN';
+        let sbClient = null;
+        try {
+            if (window.supabase && window.supabase.createClient) {
+                sbClient = window.supabase.createClient(SB_URL, SB_KEY);
+            }
+        } catch (e) { console.error('Supabase init failed', e); }
+
+        const defaultSpaces = [
+            {id: 'galas-396', object: 'GALAS', area: 396.37, floor: 2, type: 'Комерція', rate: 15, opex: 2, description: 'Комерційне приміщення на 2-му поверсі.', photos: [], mapLink: ''},
+            {id: 'galas-1031', object: 'GALAS', area: 1031.1, floor: 3, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа на 3-му поверсі.', photos: [], mapLink: ''},
+            {id: 'galas-934', object: 'GALAS', area: 934.8, floor: 4, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа на 4-му поверсі.', photos: [], mapLink: ''},
+            {id: 'wone-288', object: 'W.One Tower', area: 288, floor: 1, type: 'Комерція', rate: 25, opex: 2, description: 'Кутовий комерційний простір.', photos: [], mapLink: ''},
+            {id: 'wone-82', object: 'W.One Tower', area: 82.8, floor: 1, type: 'Комерція', rate: 30, opex: 2, description: 'Компактна комерційна площа.', photos: [], mapLink: ''},
+            {id: 'wone-36', object: 'W.One Tower', area: 36.76, floor: 1, type: 'Комерція', rate: 40, opex: 4, description: 'Мала площа з панорамним склінням.', photos: [], mapLink: ''},
+            {id: 'wone-43', object: 'W.One Tower', area: 43.85, floor: 1, type: 'Комерція', rate: 30, opex: 4, description: 'Компактна комерційна площа.', photos: [], mapLink: ''},
+            {id: 'wone-20', object: 'W.One Tower', area: 20.46, floor: 1, type: 'Комерція', rate: 60, opex: 5, description: 'Мала вітрина.', photos: [], mapLink: ''},
+            {id: 'wone-14', object: 'W.One Tower', area: 14, floor: 1, type: 'Комерція', rate: 50, opex: 5, description: 'Мала комерційна площа.', photos: [], mapLink: ''},
+            {id: 'wone-85', object: 'W.One Tower', area: 85.1, floor: 1, type: 'Комерція', rate: 30, opex: 2, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'wone-373', object: 'W.One Tower', area: 373.69, floor: 2, type: 'Комерція', rate: 15, opex: 2, description: 'Велика комерційна площа.', photos: [], mapLink: ''},
+            {id: 'wone-28', object: 'W.One Tower', area: 28.7, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-50a', object: 'W.One Tower', area: 50.4, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-50b', object: 'W.One Tower', area: 50.4, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-74', object: 'W.One Tower', area: 74.4, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-70', object: 'W.One Tower', area: 70.6, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-73', object: 'W.One Tower', area: 73.7, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-51a', object: 'W.One Tower', area: 51.5, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-51b', object: 'W.One Tower', area: 51.5, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-69', object: 'W.One Tower', area: 69.9, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-64', object: 'W.One Tower', area: 64.1, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-503', object: 'W.One Tower', area: 503, floor: 5, type: 'Офіс', rate: 10, opex: 2, description: 'Велика офісна площа.', photos: [], mapLink: ''},
+            {id: 'wone-1450a', object: 'W.One Tower', area: 1450, floor: 6, type: 'Офіс', rate: 10, opex: 2, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'wone-1450b', object: 'W.One Tower', area: 1450, floor: 7, type: 'Офіс', rate: 10, opex: 2, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'wone-1450c', object: 'W.One Tower', area: 1450, floor: 8, type: 'Офіс', rate: 10, opex: 2, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'wone-975', object: 'W.One Tower', area: 975, floor: 9, type: 'Офіс', rate: 10, opex: 2, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'mono-29', object: 'MONO', area: 29.13, floor: 1, type: 'Комерція', rate: 50, opex: 5, description: 'Компактна вітрина.', photos: [], mapLink: ''},
+            {id: 'mono-79', object: 'MONO', area: 79.85, floor: 1, type: 'Комерція', rate: 30, opex: 2, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'mono-74', object: 'MONO', area: 74.65, floor: 1, type: 'Комерція', rate: 35, opex: 3, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'mono-77', object: 'MONO', area: 77.69, floor: 1, type: 'Комерція', rate: 35, opex: 3, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'mono-79b', object: 'MONO', area: 79, floor: 1, type: 'Комерція', rate: 30, opex: 3, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'mono-96', object: 'MONO', area: 96, floor: 1, type: 'Комерція', rate: 30, opex: 3, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'mono-120', object: 'MONO', area: 120.9, floor: 1, type: 'Комерція', rate: 25, opex: 2, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'mono-132', object: 'MONO', area: 132.35, floor: 1, type: 'Комерція', rate: 25, opex: 2, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'mono-151', object: 'MONO', area: 151.8, floor: 1, type: 'Комерція', rate: 23, opex: 2, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'mono-230', object: 'MONO', area: 230.29, floor: 1, type: 'Комерція', rate: 16, opex: 1, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'mono-454', object: 'MONO', area: 454.18, floor: 1, type: 'Комерція', rate: 15, opex: 1, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'mono-602', object: 'MONO', area: 602.23, floor: 1, type: 'Комерція', rate: 15, opex: 1, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'mono-646', object: 'MONO', area: 646.83, floor: 1, type: 'Комерція', rate: 15, opex: 1, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'mono-1056', object: 'MONO', area: 1056.5, floor: 2, type: 'Офіс', rate: 10, opex: 2, description: 'Велика офісна площа.', photos: [], mapLink: ''},
+            {id: 'mono-1060', object: 'MONO', area: 1060.3, floor: 2, type: 'Офіс', rate: 10, opex: 2, description: 'Велика офісна площа.', photos: [], mapLink: ''},
+            {id: 'mono-1070a', object: 'MONO', area: 1070.8, floor: 2, type: 'Офіс', rate: 10, opex: 2, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'mono-1070b', object: 'MONO', area: 1070.9, floor: 2, type: 'Офіс', rate: 10, opex: 2, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'piro-20', object: 'Пирогівка', area: 20.94, floor: 1, type: 'Комерція', rate: 50, opex: 4, description: 'Мала площа.', photos: [], mapLink: ''},
+            {id: 'piro-39', object: 'Пирогівка', area: 39.92, floor: 1, type: 'Комерція', rate: 40, opex: 4, description: 'Компактна площа.', photos: [], mapLink: ''},
+            {id: 'piro-33', object: 'Пирогівка', area: 33.82, floor: 1, type: 'Комерція', rate: 35, opex: 4, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'piro-54', object: 'Пирогівка', area: 54.81, floor: 1, type: 'Комерція', rate: 35, opex: 4, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'piro-50', object: 'Пирогівка', area: 50.41, floor: 1, type: 'Комерція', rate: 35, opex: 4, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'piro-132', object: 'Пирогівка', area: 132.51, floor: 1, type: 'Комерція', rate: 30, opex: 2, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'piro-216', object: 'Пирогівка', area: 216.75, floor: 1, type: 'Комерція', rate: 18, opex: 2, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'piro-142', object: 'Пирогівка', area: 142.54, floor: 1, type: 'Комерція', rate: 22, opex: 2, description: 'Комерційна площа.', photos: [], mapLink: ''},
+            {id: 'piro-562', object: 'Пирогівка', area: 562.44, floor: 2, type: 'Комерція', rate: 15, opex: 2, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'piro-322', object: 'Пирогівка', area: 322.28, floor: 2, type: 'Комерція', rate: 17, opex: 2, description: 'Велика площа.', photos: [], mapLink: ''},
+            {id: 'piro-298', object: 'Пирогівка', area: 298.29, floor: 3, type: 'Комерція', rate: 16, opex: 1, description: 'Велика площа.', photos: [], mapLink: ''}
+        ];
+
+        // ========== GOOGLE SHEETS SYNC ==========
+        const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxrjpJ4Fd9UBUg0eIHIDJbWlOUK6zfwxKiGhRQnwmo6Ful2aStkBn4FPpvJ2sD1kYg/exec';
+        let syncInProgress = false;
+        
+        // ========== VARIABLES ==========
         let spaces = [], inquiries = [], proposals = [], objects = ['GALAS', 'W.One Tower', 'MONO', 'Пирогівка'], objectMeta = {}, currentSpaceId = null, currentInquiryId = null, currentMapLink = '', editingListingId = null, currentPhotos = [], currentProposal = null, isEditingProposal = false;
 
         // Безпечна функція для парсингу hex кольорів в rgba
